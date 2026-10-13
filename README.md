@@ -1,7 +1,8 @@
 # Niryo Dice Counting & Sorting
 
 Project for **Praktický robotický seminár** (*Practical Robotics Seminar*) at FMFI UK.
-A dice-counting and sorting project using the Niryo Ned robot and its camera.
+
+Using computer vision and image processing to detect, count, and sort dice using the Niryo Ned robot.
 
 ## Setup
 
@@ -9,7 +10,7 @@ A dice-counting and sorting project using the Niryo Ned robot and its camera.
 pip install pyniryo==1.1.2 numpy opencv-python
 ```
 
-After powering on the robot, run `calibrate_robot.py` to calibrate it before operating the robot.
+After powering on the robot, run `calibration.py` to calibrate it before operating the robot!
 
 ## Structure
 
