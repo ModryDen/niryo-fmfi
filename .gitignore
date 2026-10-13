@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Generated camera images
+ned_frame.png
+
+# Saved robot positions
+camera_position.json
+
+# IDE and editor files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment variables and local secrets
+.env
+.env.*
+
+# Test and coverage output
+.pytest_cache/
+.coverage
+htmlcov/
