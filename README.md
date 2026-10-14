@@ -26,4 +26,4 @@ After powering on the robot, run `calibration.py` to calibrate it before operati
 - [Assignment instructions](docs/kocky.md)
 - [Niryo Ned documentation](https://docs.niryo.com/robots/ned/)
 
-Work in progress.
+Work in progress...
