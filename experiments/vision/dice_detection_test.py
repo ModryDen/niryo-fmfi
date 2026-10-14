@@ -3,6 +3,7 @@ import numpy as np
 import cv2
 
 ROBOT_IP = "169.254.200.200"
+ROI = (0.33, 0.10, 0.68, 0.58)
 
 robot = None
 
@@ -24,12 +25,21 @@ try:
         if frame is None:
             continue
 
-        # Convert to grayscale
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        frame_height, frame_width = frame.shape[:2]
+        roi_x0 = int(frame_width * ROI[0])
+        roi_y0 = int(frame_height * ROI[1])
+        roi_x1 = int(frame_width * ROI[2])
+        roi_y1 = int(frame_height * ROI[3])
+
+        # Process only the inner working area, excluding the cable and table markers.
+        roi_gray = cv2.cvtColor(
+            frame[roi_y0:roi_y1, roi_x0:roi_x1],
+            cv2.COLOR_BGR2GRAY
+        )
 
         # Black dice -> white
         _, binary = cv2.threshold(
-            gray,
+            roi_gray,
             130,
             255,
             cv2.THRESH_BINARY_INV
@@ -52,6 +62,13 @@ try:
         )
 
         detection = frame.copy()
+        cv2.rectangle(
+            detection,
+            (roi_x0, roi_y0),
+            (roi_x1, roi_y1),
+            (255, 255, 0),
+            2
+        )
         dice_count = 0
 
         for contour in contours:
@@ -63,6 +80,8 @@ try:
                 continue
 
             x, y, w, h = cv2.boundingRect(contour)
+            x += roi_x0
+            y += roi_y0
 
             # Ignore very large objects
             if w > 400 or h > 400:
