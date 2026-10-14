@@ -30,7 +30,7 @@ try:
         # Black dice -> white
         _, binary = cv2.threshold(
             gray,
-            80,
+            130,
             255,
             cv2.THRESH_BINARY_INV
         )
