@@ -92,3 +92,44 @@ Offline calibration/confirmation tests (no robot connection or movement):
 - [Niryo Ned documentation](https://docs.niryo.com/robots/ned/)
 
 Work in progress...
+
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p test_dice_camera_calibration.py
+
+3. Priprav kalibračné body
+V Niryo Studio ručne nastav robota do bezpečnej hornej polohy nad plochou — to bude overview poloha.
+Priprav p päť nehybných, dobre rozpoznateľných bodov alebo kociek: štyri rozmiestni okolo okrajov pracovnej oblasti a piaty dovnútra. Všetky musia byť v rovnakej výške ako kocky pri neskoršom použití.
+Pre každú z piatich polôh musí byť možné bezpečne priblížiť kameru. Zvoľ jednu bezpečnú výšku priblíženia a rovnakú orientáciu kamery pre všetky body.
+4. Spusti kalibráciu kamery
+Z koreňového priečinka projektu spusti:
+.\.venv\Scripts\python.exe .\experiments\vision\dice_object_detection-rectified.py --calibrate
+
+Potom:
+
+V termináli napíš CALIBRATE a stlač Enter.
+V zobrazenom nehyblivom overview obrázku klikni na stredy štyroch vonkajších bodov a potom na stred vnútorného bodu.
+Po piatom bode stlač Enter. R vymaže výber bodov; Q kalibráciu zruší.
+Program ťa bude postupne vyzývať na priblíženie ku každému bodu. V Niryo Studio ručne nastav robota tak, aby cieľ ležal pod červeným krížom živého obrazu.
+Pri všetkých piatich bodoch zachovaj rovnakú orientáciu aj výšku nástroja. Zastav ručné ovládanie a až potom stlač C, aby sa zaznamenala poloha.
+Po poslednom bode program uloží kalibráciu do experiments\vision\dice_camera_calibration.json.
+Ak kalibrácia zahlási chybu, skontroluj výber bodov, rovnakú výšku a orientáciu. Piata poloha musí byť vnútri prvých štyroch a jej kontrolná chyba musí byť najviac 5 mm. Neobchádzaj túto kontrolu použitím nepresnej kalibrácie.
+
+5. Vráť robota do overview polohy
+Po kalibrácii program nevracia robota automaticky. Ručne vráť ho do pôvodnej overview polohy, z ktorej si kalibráciu začal. Kalibračný súbor si ponechaj. Kalibráciu treba zopakovať, ak zmeníš polohu kamery, nástroja alebo dosky, výšku kociek, overview polohu či pracovnú oblasť.
+
+6. Spusti detekciu
+V PowerShelli spusti skript bez prepínača --calibrate:
+
+.\.venv\Scripts\python.exe .\experiments\vision\dice_object_detection-rectified.py
+
+Zobrazí sa obraz kamery a okná s detekovanými kockami. Ak chýba kalibračný súbor, detekcia môže bežať, ale pohyb robota zostane zablokovaný.
+
+7. Ovládanie
+Klikaj do hlavného okna Dice Detection:
+
+Klik na detegovanú kocku — vyberie ju.
+M — požiada o priblíženie k vybranej kocke. Skontroluj naplánované polohy a celú dráhu ramena. V termináli napíš MOVE iba vtedy, ak je pohyb bezpečný; čokoľvek iné pohyb zruší.
+B — z detailného pohľadu požiada o návrat: najprv nahor a potom do overview polohy. Aj tento pohyb treba potvrdiť napísaním MOVE v termináli.
+Q — ukončí program, ale robota nevráti. Ak je robot v detailnej polohe, vráť ho bezpečne ručne.
+R — resetuje referenčný obrázok na zarovnanie.
+S — uloží binárne obrázky detegovaných kociek do priečinka dice_dataset v aktuálnom pracovnom priečinku.
+Skript nastavuje rýchlosť ramena na 10 % a po skončení ju neobnovuje. Priblíženie je určené na kontrolu obrazu, nie na uchopenie ani triedenie kociek. Tento postup nepredstavuje detekciu kolízií — bezpečnosť celej dráhy musíš vždy overiť ty.
