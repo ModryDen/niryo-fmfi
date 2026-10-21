@@ -1,8 +1,18 @@
 from pathlib import Path
+import argparse
 
 from pyniryo import NiryoRobot
 import numpy as np
 import cv2
+
+from dice_camera_calibration import (
+    CALIBRATION_FILE,
+    confirmed_move,
+    load_calibration,
+    read_frame,
+    require_pose,
+    teach_calibration,
+)
 
 ROBOT_IP = "169.254.200.200"
 
@@ -247,28 +257,67 @@ def draw_detections(frame, detections, roi_bounds):
 def main():
     global reference_gray
 
+    parser = argparse.ArgumentParser(description="Detect dice and teach camera close-up poses.")
+    parser.add_argument("--calibrate", action="store_true",
+                        help="Teach camera mapping manually; does not move the robot.")
+    args = parser.parse_args()
     robot = None
     open_die_windows = set()
+    selection = {"pixel": None}
+    close_up_pose = None
+
+    def select_die(event, x, y, _flags, _param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            selection["pixel"] = (x, y)
 
     try:
         robot = NiryoRobot(ROBOT_IP)
         print("ROBOT CONNECTED")
-        print("Q = quit | R = reset alignment reference")
+        intrinsics = robot.get_camera_intrinsics()
+        if args.calibrate:
+            teach_calibration(robot, intrinsics)
+            return
+        calibration = load_calibration(intrinsics) if CALIBRATION_FILE.exists() else None
+        if calibration is None:
+            print("Motion disabled: first run this script with --calibrate.")
+        print("Click a die | M = confirm close-up | B = confirm return to overview")
+        print("Q = quit (no automatic return) | R = reset alignment reference | S = save")
+        cv2.namedWindow("Dice Detection")
+        cv2.setMouseCallback("Dice Detection", select_die)
 
         while True:
-            img_comp = robot.get_img_compressed()
-            img_array = np.frombuffer(img_comp, dtype=np.uint8)
-            frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+            frame = read_frame(robot, intrinsics)
 
-            if frame is None:
+            if close_up_pose is not None:
+                cv2.imshow("Dice Detection", frame)
+                key = cv2.waitKey(20) & 0xFF
+                if key == ord("q"):
+                    break
+                if key == ord("b"):
+                    raised = close_up_pose.copy()
+                    raised[2] = calibration.overview[2]
+                    if confirmed_move(
+                        robot, close_up_pose, [raised, calibration.overview]
+                    ):
+                        close_up_pose = None
+                        selection["pixel"] = None
                 continue
 
             detections, roi_bounds = detect_dice(frame)
+            selected = None
+            if selection["pixel"] is not None:
+                for die in detections:
+                    if cv2.pointPolygonTest(
+                        die["contour"], selection["pixel"], False
+                    ) >= 0:
+                        selected = die
+                        break
+            output = draw_detections(frame, detections, roi_bounds)
+            if selected is not None:
+                cv2.drawContours(output, [selected["contour"]], -1, (0, 255, 255), 3)
+                cv2.imshow("Selected Die", selected["warped"])
 
-            cv2.imshow(
-                "Dice Detection",
-                draw_detections(frame, detections, roi_bounds)
-            )
+            cv2.imshow("Dice Detection", output)
 
             current_windows = set()
 
@@ -306,6 +355,31 @@ def main():
             elif key == ord("r"):
                 reference_gray = None
                 print("Alignment reference reset.")
+            elif key == ord("m"):
+                if calibration is None:
+                    print("Motion blocked: calibration is missing. Run with --calibrate.")
+                    continue
+                if selected is None:
+                    print("Motion blocked: click inside a currently detected die.")
+                    continue
+                try:
+                    require_pose(robot.get_pose().to_list(), calibration.overview)
+                    target = calibration.target(
+                        selected["center"], (frame.shape[1], frame.shape[0])
+                    )
+                except ValueError as error:
+                    print(f"Motion blocked: {error}")
+                    continue
+                raised = target.copy()
+                raised[2] = calibration.overview[2]
+                print(f"Selected die centre (undistorted pixels): {selected['center']}")
+                if confirmed_move(robot, calibration.overview, [raised, target]):
+                    close_up_pose = target
+                    for window_name in open_die_windows:
+                        cv2.destroyWindow(window_name)
+                    open_die_windows.clear()
+                    cv2.destroyWindow("Selected Die")
+                    print("Close-up view. B = confirmed return; Q leaves the robot here.")
 
     except Exception as e:
         print("DETECTION FAILED")

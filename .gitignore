@@ -10,6 +10,7 @@ ned_frame.png
 
 # Saved robot positions
 camera_position.json
+dice_camera_calibration.json
 
 # IDE and editor files
 .vscode/

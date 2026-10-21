@@ -1,0 +1,220 @@
+import copy
+import importlib.util
+from pathlib import Path
+import sys
+import unittest
+from unittest.mock import Mock, patch
+
+import cv2
+import numpy as np
+
+
+MODULE_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "experiments" / "vision" / "dice_camera_calibration.py"
+)
+SPEC = importlib.util.spec_from_file_location("dice_camera_calibration", MODULE_PATH)
+calibration = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(calibration)
+DETECTOR_SPEC = importlib.util.spec_from_file_location(
+    "rectified_detector", MODULE_PATH.with_name("dice_object_detection-rectified.py")
+)
+detector = importlib.util.module_from_spec(DETECTOR_SPEC)
+with patch.dict(sys.modules, {"dice_camera_calibration": calibration}):
+    DETECTOR_SPEC.loader.exec_module(detector)
+
+
+def sample_data():
+    pixels = [[100, 100], [500, 100], [500, 400], [100, 400], [300, 250]]
+    return {
+        "version": 1,
+        "image_size": [640, 480],
+        "overview": [0.25, 0, 0.4, 0, 1.57, 0],
+        "pixels": pixels,
+        "poses": [
+            [0.1 + x * 0.0005, -0.2 + y * 0.0005, 0.2, 0, 1.57, 0]
+            for x, y in pixels
+        ],
+        "camera_matrix": np.eye(3).tolist(),
+        "distortion": [[0, 0, 0, 0, 0]],
+    }
+
+
+class FakeRobot:
+    def __init__(self, pose, learning=False):
+        self.pose = pose
+        self.learning = learning
+        self.moves = []
+        self.speeds = []
+
+    def get_pose(self):
+        return self
+
+    def to_list(self):
+        return list(self.pose)
+
+    def get_learning_mode(self):
+        return self.learning
+
+    def set_arm_max_velocity(self, speed):
+        self.speeds.append(speed)
+
+    def move_linear_pose(self, pose):
+        self.moves.append(pose)
+        self.pose = pose
+
+
+class CalibrationTests(unittest.TestCase):
+    def setUp(self):
+        self.data = sample_data()
+        self.mapping = calibration.CameraCalibration(self.data)
+
+    def test_known_and_interpolated_targets(self):
+        for point, expected in [
+            ([300, 250], [0.25, -0.075, 0.2]),
+            ([200, 200], [0.20, -0.1, 0.2]),
+            ([100, 100], [0.15, -0.15, 0.2]),
+        ]:
+            np.testing.assert_allclose(
+                self.mapping.target(point, (640, 480))[:3], expected, atol=1e-6
+            )
+        self.assertLess(self.mapping.error, 1e-6)
+
+    def test_reject_outside_and_changed_resolution(self):
+        with self.assertRaisesRegex(ValueError, "outside"):
+            self.mapping.target([50, 200], (640, 480))
+        with self.assertRaisesRegex(ValueError, "resolution"):
+            self.mapping.target([300, 250], (1280, 960))
+        with self.assertRaisesRegex(ValueError, "finite"):
+            self.mapping.target([np.nan, 250], (640, 480))
+
+    def test_independent_validation_rejects_inaccurate_mapping(self):
+        self.data["poses"][4][0] += 0.006
+        with self.assertRaisesRegex(ValueError, "exceeds 5 mm"):
+            calibration.CameraCalibration(self.data)
+
+    def test_reject_inconsistent_height_orientation_and_overview(self):
+        for index, coordinate, change, message in [
+            (2, 2, 0.01, "SAME safe close-up"),
+            (2, 3, 0.1, "SAME camera orientation"),
+        ]:
+            data = copy.deepcopy(self.data)
+            data["poses"][index][coordinate] += change
+            with self.assertRaisesRegex(ValueError, message):
+                calibration.CameraCalibration(data)
+        self.data["overview"][2] = 0.19
+        with self.assertRaisesRegex(ValueError, "above"):
+            calibration.CameraCalibration(self.data)
+
+    def test_reject_degenerate_points(self):
+        self.data["pixels"][3] = self.data["pixels"][2]
+        with self.assertRaisesRegex(ValueError, "convex"):
+            calibration.CameraCalibration(self.data)
+
+    def test_reject_invalid_check_point(self):
+        self.data["pixels"][4] = [20, 20]
+        with self.assertRaisesRegex(ValueError, "inside the first four"):
+            calibration.CameraCalibration(self.data)
+
+    def test_pose_guard_and_wrapped_angles(self):
+        calibration.require_pose(self.data["overview"], self.data["overview"])
+        wrapped = list(self.data["overview"])
+        wrapped[5] += 2 * np.pi
+        calibration.require_pose(wrapped, self.data["overview"])
+        moved = list(self.data["overview"])
+        moved[0] += 0.01
+        with self.assertRaisesRegex(ValueError, "required taught pose"):
+            calibration.require_pose(moved, self.data["overview"])
+
+    def test_no_confirmation_means_no_motion(self):
+        robot = FakeRobot(self.data["overview"])
+        with patch("builtins.input", return_value="cancel"):
+            self.assertFalse(calibration.confirmed_move(
+                robot, self.mapping.overview, [self.mapping.overview]
+            ))
+        self.assertEqual(robot.moves, [])
+        self.assertEqual(robot.speeds, [])
+
+    def test_confirmed_waypoints_and_speed(self):
+        robot = FakeRobot(self.data["overview"])
+        target = self.mapping.target([300, 250], (640, 480))
+        raised = target.copy()
+        raised[2] = self.mapping.overview[2]
+        with patch("builtins.input", return_value="MOVE"):
+            self.assertTrue(calibration.confirmed_move(
+                robot, self.mapping.overview, [raised, target]
+            ))
+        np.testing.assert_allclose(robot.moves, [raised, target])
+        self.assertEqual(robot.speeds, [10])
+
+    def test_robot_moved_during_confirmation(self):
+        robot = FakeRobot(list(self.data["overview"]))
+
+        def move_before_confirm(_prompt):
+            robot.pose[0] += 0.01
+            return "MOVE"
+
+        with patch("builtins.input", side_effect=move_before_confirm):
+            with self.assertRaisesRegex(ValueError, "required taught pose"):
+                calibration.confirmed_move(
+                    robot, self.mapping.overview, [self.mapping.overview]
+                )
+        self.assertEqual(robot.moves, [])
+
+    def test_learning_mode_blocks_motion(self):
+        robot = FakeRobot(self.data["overview"], learning=True)
+        with patch("builtins.input", return_value="MOVE"):
+            with self.assertRaisesRegex(ValueError, "learning mode"):
+                calibration.confirmed_move(
+                    robot, self.mapping.overview, [self.mapping.overview]
+                )
+        self.assertEqual(robot.moves, [])
+
+    def test_motion_failure_stops_remaining_waypoints(self):
+        robot = FakeRobot(self.data["overview"])
+        target = self.mapping.target([300, 250], (640, 480))
+        with (
+            patch("builtins.input", return_value="MOVE"),
+            patch.object(robot, "move_linear_pose", side_effect=RuntimeError("blocked")) as move,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "blocked"):
+                calibration.confirmed_move(robot, self.mapping.overview, [target, target])
+        self.assertEqual(move.call_count, 1)
+
+    def test_detector_preserves_roi_and_rectified_outputs(self):
+        frame = np.full((480, 640, 3), 240, dtype=np.uint8)
+        for x, y in [(250, 100), (350, 180)]:
+            cv2.rectangle(frame, (x, y), (x + 40, y + 40), (10, 10, 10), -1)
+            cv2.circle(frame, (x + 20, y + 20), 4, (240, 240, 240), -1)
+        cv2.rectangle(frame, (20, 20), (60, 60), (10, 10, 10), -1)
+        detections, bounds = detector.detect_dice(frame)
+        self.assertEqual(len(detections), 2)
+        self.assertEqual(bounds, (211, 48, 435, 278))
+        for die in detections:
+            self.assertEqual(die["warped"].shape, (256, 256, 3))
+            self.assertEqual(die["warped_binary"].shape, (256, 256))
+
+    def test_missing_calibration_blocks_motion_in_main(self):
+        robot = Mock()
+        frame = np.full((480, 640, 3), 240, dtype=np.uint8)
+        with (
+            patch.object(sys, "argv", ["rectified_detector"]),
+            patch.object(detector, "NiryoRobot", return_value=robot),
+            patch.object(detector, "CALIBRATION_FILE") as file,
+            patch.object(detector, "read_frame", return_value=frame),
+            patch.object(detector.cv2, "namedWindow"),
+            patch.object(detector.cv2, "setMouseCallback"),
+            patch.object(detector.cv2, "imshow"),
+            patch.object(detector.cv2, "destroyAllWindows"),
+            patch.object(detector.cv2, "waitKey", side_effect=[ord("m"), ord("q")]),
+            patch.object(detector, "confirmed_move") as move,
+        ):
+            file.exists.return_value = False
+            detector.main()
+        move.assert_not_called()
+        robot.move_linear_pose.assert_not_called()
+        robot.close_connection.assert_called_once()
+
+
+if __name__ == "__main__":
+    unittest.main()
