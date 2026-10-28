@@ -12,6 +12,35 @@ pip install pyniryo==1.1.2 numpy opencv-python
 
 After powering on the robot, run `calibration.py` to calibrate it before operating the robot!
 
+## Automatic board detection
+
+The rectified detector locates the four concentric circular Niryo markers in each
+undistorted camera frame, checking nested, approximately concentric round contours
+with adaptive and global thresholding, including a lower-contrast Gaussian
+threshold for slightly blurred rings. This avoids treating a square die with a
+central pip as a ring marker, which the installed SDK candidate finder can do.
+There is no fixed rectangular ROI. The cyan outline follows the usable interior
+of the marker quadrilateral; yellow `M1`-`M4` labels show the detected corners.
+The marker rings and a small border margin are excluded from dice detection.
+Only dice contours entirely inside this mask are accepted. Coordinates remain
+in the original undistorted image so click selection and camera calibration use
+the same pixel coordinate system.
+
+Keep all four markers visible, in focus and uncovered, with sufficient contrast.
+If fewer or more than four marker candidates are found, or their geometry is
+invalid, the display says `Workspace NOT found` and `Dice: --`; detection and
+approach requests are blocked instead of reusing an old region or guessing a
+missing corner. The close-up view and confirmed return do not require the board
+markers to remain in view. This detector is intended for the Niryo ring-marker
+board, not arbitrary boards or generic object recognition.
+The missing-workspace warning is drawn at the bottom of the view so it does not
+cover the upper markers in diagnostic screenshots.
+
+Automatic board detection is **not robot-coordinate calibration** and does not
+make it safe to move the board after teaching. Re-teach the camera mapping after
+changing the board or overview pose. Motion still requires a valid taught
+calibration and explicit confirmation.
+
 ## Selecting a die and teaching camera close-ups
 
 The rectified detector supports click selection and **operator-confirmed** physical
@@ -66,7 +95,7 @@ session; inspect the robot and return manually before restarting.
 for the entire arm, not just the camera. This empirical planar mapping is not
 collision avoidance. Do not move dice while confirming a motion. Re-teach after
 changing the overview, board plane, die height, camera mounting, tool, or close-up
-distance. Targets must remain within the calibrated region and detector ROI.
+distance. Targets must remain within the calibrated region and detected board interior.
 The taught framing determines magnification: one isolated die in view is not
 guaranteed if neighbours are too close, the die height changes, or the teaching
 is inaccurate. Check the live view; the script never descends further on its own.

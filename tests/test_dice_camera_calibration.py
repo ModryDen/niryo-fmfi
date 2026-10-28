@@ -40,6 +40,16 @@ def sample_data():
     }
 
 
+def workspace_frame(corners=None):
+    frame = np.full((480, 640, 3), 240, dtype=np.uint8)
+    if corners is None:
+        corners = [(100, 80), (540, 80), (540, 420), (100, 420)]
+    for point in corners:
+        for radius, color in [(16, 10), (12, 240), (8, 10), (4, 240)]:
+            cv2.circle(frame, point, radius, (color, color, color), -1)
+    return frame
+
+
 class FakeRobot:
     def __init__(self, pose, learning=False):
         self.pose = pose
@@ -181,22 +191,25 @@ class CalibrationTests(unittest.TestCase):
                 calibration.confirmed_move(robot, self.mapping.overview, [target, target])
         self.assertEqual(move.call_count, 1)
 
-    def test_detector_preserves_roi_and_rectified_outputs(self):
-        frame = np.full((480, 640, 3), 240, dtype=np.uint8)
+    def test_detector_preserves_rectified_outputs_in_automatic_workspace(self):
+        frame = workspace_frame()
         for x, y in [(250, 100), (350, 180)]:
             cv2.rectangle(frame, (x, y), (x + 40, y + 40), (10, 10, 10), -1)
             cv2.circle(frame, (x + 20, y + 20), 4, (240, 240, 240), -1)
         cv2.rectangle(frame, (20, 20), (60, 60), (10, 10, 10), -1)
-        detections, bounds = detector.detect_dice(frame)
+        detections, workspace = detector.detect_dice(frame)
         self.assertEqual(len(detections), 2)
-        self.assertEqual(bounds, (211, 48, 435, 278))
+        self.assertIsNotNone(workspace)
+        np.testing.assert_allclose(
+            workspace.corners, [(100, 80), (540, 80), (540, 420), (100, 420)], atol=1
+        )
         for die in detections:
             self.assertEqual(die["warped"].shape, (256, 256, 3))
             self.assertEqual(die["warped_binary"].shape, (256, 256))
 
     def test_missing_calibration_blocks_motion_in_main(self):
         robot = Mock()
-        frame = np.full((480, 640, 3), 240, dtype=np.uint8)
+        frame = workspace_frame()
         with (
             patch.object(sys, "argv", ["rectified_detector"]),
             patch.object(detector, "NiryoRobot", return_value=robot),
@@ -214,6 +227,121 @@ class CalibrationTests(unittest.TestCase):
         move.assert_not_called()
         robot.move_linear_pose.assert_not_called()
         robot.close_connection.assert_called_once()
+
+    def test_workspace_without_dice_excludes_ring_markers(self):
+        detections, workspace = detector.detect_dice(workspace_frame())
+        self.assertIsNotNone(workspace)
+        self.assertEqual(detections, [])
+
+    def test_missing_or_extra_markers_do_not_fall_back_to_fixed_roi(self):
+        for corners in [
+            [],
+            [(100, 80), (540, 80), (540, 420)],
+            [(100, 80), (540, 80), (540, 420), (100, 420), (600, 240)],
+        ]:
+            frame = workspace_frame(corners)
+            cv2.rectangle(frame, (250, 150), (290, 190), (10, 10, 10), -1)
+            detections, workspace = detector.detect_dice(frame)
+            self.assertIsNone(workspace)
+            self.assertEqual(detections, [])
+
+    def test_perspective_workspace_rejects_outside_and_edge_objects(self):
+        corners = [(130, 70), (500, 100), (550, 410), (80, 380)]
+        frame = workspace_frame(corners)
+        cv2.rectangle(frame, (300, 200), (330, 230), (10, 10, 10), -1)
+        # Inside the bounding rectangle, but outside the slanted board edge.
+        cv2.rectangle(frame, (85, 100), (110, 125), (10, 10, 10), -1)
+        cv2.rectangle(frame, (95, 250), (125, 280), (10, 10, 10), -1)
+        detections, workspace = detector.detect_dice(frame)
+        self.assertIsNotNone(workspace)
+        self.assertEqual(len(detections), 1)
+        np.testing.assert_allclose(detections[0]["center"], (315, 215), atol=1)
+
+    def test_workspace_follows_shifted_and_rotated_markers(self):
+        for corners in [
+            [(40, 40), (390, 40), (390, 330), (40, 330)],
+            [(300, 30), (570, 230), (350, 440), (80, 220)],
+        ]:
+            frame = workspace_frame(corners)
+            cv2.rectangle(frame, (240, 180), (270, 210), (10, 10, 10), -1)
+            detections, workspace = detector.detect_dice(frame)
+            self.assertIsNotNone(workspace)
+            self.assertEqual(len(detections), 1)
+
+    def test_blurred_markers(self):
+        frame = cv2.GaussianBlur(workspace_frame(), (5, 5), 1.0)
+        self.assertIsNotNone(detector.detect_workspace(frame))
+
+    def test_blurred_low_contrast_markers_with_dark_surroundings(self):
+        for sigma in (1, 2):
+            with self.subTest(sigma=sigma):
+                frame = workspace_frame()
+                frame = (140 + frame.astype(np.float32) / 255 * 50).astype(np.uint8)
+                frame[:, :50] = 15
+                frame = cv2.GaussianBlur(frame, (11, 11), sigma)
+                workspace = detector.detect_workspace(frame)
+                self.assertIsNotNone(workspace)
+                np.testing.assert_allclose(
+                    workspace.corners,
+                    [(100, 80), (540, 80), (540, 420), (100, 420)],
+                    atol=1,
+                )
+
+    def test_pips_and_square_patterns_are_not_ring_markers(self):
+        frame = workspace_frame([])
+        for x, y in [(150, 100), (350, 100), (150, 300), (350, 300)]:
+            for half_side, color in [(20, 10), (15, 240), (10, 10), (5, 240)]:
+                cv2.rectangle(
+                    frame, (x - half_side, y - half_side),
+                    (x + half_side, y + half_side), (color, color, color), -1
+                )
+        self.assertIsNone(detector.detect_workspace(frame))
+
+    def test_real_board_from_existing_project_screenshot(self):
+        image = cv2.imread(str(MODULE_PATH.parents[1] / "extra" / "ahoj.png"))
+        self.assertIsNotNone(image)
+        # The existing screenshot contains the camera view in the upper-left window.
+        frame = image[104:700, 56:854].copy()
+        dice, workspace = detector.detect_dice(frame)
+        self.assertIsNotNone(workspace)
+        self.assertEqual(len(dice), 3)
+        np.testing.assert_allclose(
+            workspace.corners, [(228, 33), (551, 28), (568, 356), (222, 358)], atol=2
+        )
+
+    def test_degenerate_marker_geometry(self):
+        for corners in [
+            [(100, 100), (220, 100), (340, 100), (460, 100)],
+            [(100, 80), (540, 80), (540, 420), (300, 200)],
+        ]:
+            self.assertIsNone(detector.detect_workspace(workspace_frame(corners)))
+
+    def test_marker_loss_clears_previous_workspace(self):
+        self.assertIsNotNone(detector.detect_workspace(workspace_frame()))
+        detections, workspace = detector.detect_dice(workspace_frame([]))
+        self.assertEqual(detections, [])
+        self.assertIsNone(workspace)
+
+    def test_missing_markers_block_motion_even_with_calibration(self):
+        robot = Mock()
+        frame = workspace_frame([])
+        with (
+            patch.object(sys, "argv", ["rectified_detector"]),
+            patch.object(detector, "NiryoRobot", return_value=robot),
+            patch.object(detector, "CALIBRATION_FILE") as file,
+            patch.object(detector, "load_calibration", return_value=self.mapping),
+            patch.object(detector, "read_frame", return_value=frame),
+            patch.object(detector.cv2, "namedWindow"),
+            patch.object(detector.cv2, "setMouseCallback"),
+            patch.object(detector.cv2, "imshow"),
+            patch.object(detector.cv2, "destroyAllWindows"),
+            patch.object(detector.cv2, "waitKey", side_effect=[ord("m"), ord("q")]),
+            patch.object(detector, "confirmed_move") as move,
+        ):
+            file.exists.return_value = True
+            detector.main()
+        move.assert_not_called()
+        robot.move_linear_pose.assert_not_called()
 
 
 if __name__ == "__main__":

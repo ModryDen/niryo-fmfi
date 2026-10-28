@@ -1,5 +1,6 @@
 from pathlib import Path
 import argparse
+from dataclasses import dataclass
 
 from pyniryo import NiryoRobot
 import numpy as np
@@ -18,9 +19,6 @@ ROBOT_IP = "169.254.200.200"
 
 SAVE_DIR = Path("dice_dataset")
 
-# Normalized ROI: left, top, right, bottom
-ROI = (0.33, 0.10, 0.68, 0.58)
-
 MIN_AREA = 150
 MAX_DIE_SIZE = 150
 MIN_ASPECT_RATIO = 0.65
@@ -33,6 +31,90 @@ ECC_ITERATIONS = 100
 ECC_EPSILON = 1e-6
 
 reference_gray = None
+
+
+@dataclass
+class Workspace:
+    corners: np.ndarray
+    mask: np.ndarray
+
+
+def find_ring_markers(gray):
+    adaptive = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 15, 25
+    )
+    low_contrast = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 5
+    )
+    _, global_threshold = cv2.threshold(
+        gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+    )
+    candidates = []
+    for threshold in (adaptive, low_contrast, global_threshold):
+        contours, hierarchy = cv2.findContours(
+            threshold, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
+        )
+        if hierarchy is None:
+            continue
+        for index, contour in enumerate(contours):
+            (cx, cy), radius = cv2.minEnclosingCircle(contour)
+            if not 7 <= radius <= min(gray.shape) * 0.12:
+                continue
+            center = np.array([cx, cy])
+            nested = 0
+            current = index
+            while current >= 0:
+                ring = contours[current]
+                area = cv2.contourArea(ring)
+                perimeter = cv2.arcLength(ring, True)
+                if perimeter == 0:
+                    break
+                circularity = 4 * np.pi * area / perimeter ** 2
+                if circularity < (0.83 if nested == 0 else 0.70):
+                    break
+                (rx, ry), _ = cv2.minEnclosingCircle(ring)
+                if np.linalg.norm(np.array([rx, ry]) - center) > max(2, radius * 0.15):
+                    break
+                nested += 1
+                current = hierarchy[0, current, 2]
+            if nested >= 3:
+                candidates.append((center, radius))
+
+    # Each ring and threshold can produce the same marker; keep its largest contour.
+    markers = []
+    for center, radius in sorted(candidates, key=lambda item: item[1], reverse=True):
+        if not any(
+            np.linalg.norm(center - other) <= max(3, other_radius * 0.25)
+            for other, other_radius in markers
+        ):
+            markers.append((center, radius))
+    return markers
+
+
+def detect_workspace(frame):
+    """Locate exactly four Niryo ring markers without guessing missing corners."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    markers = find_ring_markers(gray)
+    if len(markers) != 4:
+        return None
+
+    centers = np.asarray([center for center, _ in markers], dtype=np.float32)
+    hull = cv2.convexHull(centers).reshape(-1, 2)
+    if len(hull) != 4 or cv2.contourArea(hull) < 2500:
+        return None
+    corners = np.int32(np.round(order_corners(hull)))
+    sides = np.linalg.norm(np.roll(corners, -1, axis=0) - corners, axis=1)
+    radii = [radius for _, radius in markers]
+    if min(sides) < 4 * max(radii) or max(sides) / min(sides) > 4:
+        return None
+
+    mask = np.zeros(gray.shape, dtype=np.uint8)
+    cv2.fillConvexPoly(mask, corners, 255)
+    mask = cv2.erode(mask, np.ones((5, 5), np.uint8))
+    for center, radius in markers:
+        point = tuple(map(int, np.round(center)))
+        cv2.circle(mask, point, int(np.ceil(radius)) + 3, 0, -1)
+    return Workspace(corners, mask)
 
 
 def order_corners(points):
@@ -132,21 +214,21 @@ def align_ecc(reference, image):
 
 
 def detect_dice(frame):
-    height, width = frame.shape[:2]
+    workspace = detect_workspace(frame)
+    if workspace is None:
+        return [], None
 
-    x0 = int(width * ROI[0])
-    y0 = int(height * ROI[1])
-    x1 = int(width * ROI[2])
-    y1 = int(height * ROI[3])
-
+    x0, y0, width, height = cv2.boundingRect(workspace.corners)
+    x1, y1 = x0 + width, y0 + height
     roi = frame[y0:y1, x0:x1]
+    workspace_mask = workspace.mask[y0:y1, x0:x1]
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
 
+    threshold, _ = cv2.threshold(
+        gray[workspace_mask != 0], 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+    )
     _, binary = cv2.threshold(
-        gray,
-        0,
-        255,
-        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+        gray, threshold, 255, cv2.THRESH_BINARY_INV
     )
 
     open_kernel = np.ones(
@@ -170,6 +252,11 @@ def detect_dice(frame):
     for contour in contours:
         area = cv2.contourArea(contour)
         if area < MIN_AREA:
+            continue
+
+        contour_mask = np.zeros(gray.shape, dtype=np.uint8)
+        cv2.drawContours(contour_mask, [contour], -1, 255, -1)
+        if np.any((contour_mask != 0) & (workspace_mask == 0)):
             continue
 
         rect = cv2.minAreaRect(contour)
@@ -226,14 +313,30 @@ def detect_dice(frame):
         key=lambda die: (die["center"][1], die["center"][0])
     )
 
-    return detections, (x0, y0, x1, y1)
+    return detections, workspace
 
 
-def draw_detections(frame, detections, roi_bounds):
+def draw_detections(frame, detections, workspace):
     output = frame.copy()
-    x0, y0, x1, y1 = roi_bounds
 
-    cv2.rectangle(output, (x0, y0), (x1, y1), (255, 255, 0), 2)
+    if workspace is None:
+        cv2.putText(
+            output, "Workspace NOT found: show all 4 ring markers",
+            (10, frame.shape[0] - 20),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2
+        )
+    else:
+        contours, _ = cv2.findContours(
+            workspace.mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        cv2.drawContours(output, contours, -1, (255, 255, 0), 2)
+        for index, corner in enumerate(workspace.corners, start=1):
+            point = tuple(map(int, corner))
+            cv2.circle(output, point, 5, (0, 255, 255), -1)
+            cv2.putText(
+                output, f"M{index}", (point[0] + 8, point[1] - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2
+            )
 
     for index, die in enumerate(detections, start=1):
         cv2.drawContours(output, [die["contour"]], -1, (0, 255, 0), 2)
@@ -247,7 +350,8 @@ def draw_detections(frame, detections, roi_bounds):
         )
 
     cv2.putText(
-        output, f"Dice: {len(detections)}", (20, 40),
+        output, f"Dice: {len(detections)}" if workspace is not None else "Dice: --",
+        (20, 40),
         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2
     )
 
@@ -265,6 +369,7 @@ def main():
     open_die_windows = set()
     selection = {"pixel": None}
     close_up_pose = None
+    workspace_visible = None
 
     def select_die(event, x, y, _flags, _param):
         if event == cv2.EVENT_LBUTTONDOWN:
@@ -280,6 +385,7 @@ def main():
         calibration = load_calibration(intrinsics) if CALIBRATION_FILE.exists() else None
         if calibration is None:
             print("Motion disabled: first run this script with --calibrate.")
+        print("Workspace is detected automatically from all four Niryo ring markers.")
         print("Click a die | M = confirm close-up | B = confirm return to overview")
         print("Q = quit (no automatic return) | R = reset alignment reference | S = save")
         cv2.namedWindow("Dice Detection")
@@ -303,7 +409,17 @@ def main():
                         selection["pixel"] = None
                 continue
 
-            detections, roi_bounds = detect_dice(frame)
+            detections, workspace = detect_dice(frame)
+            visible = workspace is not None
+            if visible != workspace_visible:
+                print(
+                    "Workspace found: 4 ring markers."
+                    if visible else
+                    "Workspace NOT found or ambiguous: show all 4 ring markers. Motion blocked."
+                )
+                workspace_visible = visible
+            if not visible:
+                selection["pixel"] = None
             selected = None
             if selection["pixel"] is not None:
                 for die in detections:
@@ -312,7 +428,7 @@ def main():
                     ) >= 0:
                         selected = die
                         break
-            output = draw_detections(frame, detections, roi_bounds)
+            output = draw_detections(frame, detections, workspace)
             if selected is not None:
                 cv2.drawContours(output, [selected["contour"]], -1, (0, 255, 255), 3)
                 cv2.imshow("Selected Die", selected["warped"])
@@ -356,6 +472,9 @@ def main():
                 reference_gray = None
                 print("Alignment reference reset.")
             elif key == ord("m"):
+                if workspace is None:
+                    print("Motion blocked: all four workspace markers must be visible.")
+                    continue
                 if calibration is None:
                     print("Motion blocked: calibration is missing. Run with --calibrate.")
                     continue
