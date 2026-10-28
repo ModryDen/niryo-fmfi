@@ -20,7 +20,10 @@ DETECTOR_SPEC = importlib.util.spec_from_file_location(
     "rectified_detector", MODULE_PATH.with_name("dice_object_detection-rectified.py")
 )
 detector = importlib.util.module_from_spec(DETECTOR_SPEC)
-with patch.dict(sys.modules, {"dice_camera_calibration": calibration}):
+with (
+    patch.dict(sys.modules, {"dice_camera_calibration": calibration}),
+    patch.object(sys, "path", [str(MODULE_PATH.parent), *sys.path]),
+):
     DETECTOR_SPEC.loader.exec_module(detector)
 
 

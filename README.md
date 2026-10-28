@@ -65,6 +65,63 @@ make it safe to move the board after teaching. Re-teach the camera mapping after
 changing the board or overview pose. Motion still requires a valid taught
 calibration and explicit confirmation.
 
+## Non-contact camera-to-arm calibration (read-only)
+
+Run [dice_hand_eye_calibration.py](experiments/vision/dice_hand_eye_calibration.py)
+with VS Code's Run Python File, or:
+
+```powershell
+.\.venv\Scripts\python.exe .\experiments\vision\dice_hand_eye_calibration.py --board-size-mm 170
+```
+
+The measured distance **between marker centres** is 170 mm on each side of the
+current square board. Change the argument if using a different square board.
+No calibration tip or precise centring over dice is needed. This is not
+single-image auto-calibration: the camera-to-arm transform needs diverse robot
+poses. The script sends **no motion commands**, including after a successful fit.
+
+1. Keep the empty board fixed. Start in a clear overview pose with all four
+   markers visible. Keep the camera and tool mounting rigid throughout.
+2. Type `CAPTURE` in the terminal. This starts a new observation session;
+   previous draft observations are replaced. An existing checked result is
+   replaced only after another successful fit.
+3. Use Studio to choose safe overview poses, never descend towards the board.
+   Keep **joint 6 fixed at its initial angle**: the camera can be attached before
+   this joint, so an effective camera-to-tool transform is valid only at that
+   angle. This restriction also applies to any future use of the result.
+4. Stop manual control, wait at least one second, then press `C` in the image
+   window. Collect at least **8 distinct views**. The first six (or more) must
+   include changes of orientation about **two different axes**, not just X/Y
+   shifts or rotation around one axis. Their total rotational span must reach
+   at least 15 degrees; do not make a move unless you can verify clearance.
+   There are no prescribed joint targets or automatic rotations.
+5. Keep labels M1-M4 on the same physical markers in every view; avoid large
+   camera roll or crossing to the other side of the board. The ring detector's
+   labels are image-oriented, not persistent marker IDs.
+6. The final **two views** are independent checks and are not used in fitting.
+   They should also be different overview poses. `U` removes the last view.
+   `F` solves and checks the geometry; `Q` leaves without fitting.
+
+Captures reject motion, unstable images, missing markers, duplicate poses,
+changed joint 6, ambiguous planar pose, and board reprojection RMSE over 3 px.
+The rigid hand-eye equation `A X = X B` is solved using rotation-vector SVD and
+translation least squares (the installed OpenCV 5 build does not expose
+`calibrateHandEye`). Both training and held-out views must agree on all four
+board corners within 5 mm and orientation within 2 degrees.
+
+Unvalidated observations are saved to `dice_hand_eye_samples.json`; there is no
+automatic resume. A successful fit writes `dice_hand_eye_calibration.json` with
+explicitly named **camera-to-tool** and **board-to-base** transforms, intrinsics,
+joint-6 restriction, raw samples and per-view check errors. Both files are local
+and ignored by Git. Size measurement error, camera calibration error and robot
+kinematic errors can bias all views together: these consistency checks are
+**not a guarantee of absolute accuracy or collision safety**.
+
+**The result is not yet connected to motion in the dice detector.** It does not
+create a Studio Workspace, replace the older five-point file, or enable `M`.
+Independent physical validation and a safe approach planner are required before
+using this geometry for movement.
+
 ## Optional: selecting a die and teaching camera close-ups
 
 The rectified detector supports click selection and **operator-confirmed** physical
@@ -127,7 +184,7 @@ is inaccurate. Check the live view; the script never descends further on its own
 Offline calibration/confirmation tests (no robot connection or movement):
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest discover -s tests -p test_dice_camera_calibration.py
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_dice*calibration.py"
 ```
 
 ## Structure
