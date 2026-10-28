@@ -38,6 +38,15 @@ class Workspace:
     corners: np.ndarray
     mask: np.ndarray
 
+    def relative_position(self, pixel):
+        destination = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=np.float32)
+        transform = cv2.getPerspectiveTransform(
+            self.corners.astype(np.float32), destination
+        )
+        point = np.asarray([[pixel]], dtype=np.float32)
+        relative = cv2.perspectiveTransform(point, transform)[0, 0]
+        return float(relative[0]), float(relative[1])
+
 
 def find_ring_markers(gray):
     adaptive = cv2.adaptiveThreshold(
@@ -299,6 +308,7 @@ def detect_dice(frame):
 
         detections.append({
             "center": center,
+            "workspace_position": workspace.relative_position(center),
             "angle": angle,
             "area": area,
             "size": (rw, rh),
@@ -348,6 +358,11 @@ def draw_detections(frame, detections, workspace):
             output, f"Die {index}", (cx + 8, cy - 8),
             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2
         )
+        x_rel, y_rel = die["workspace_position"]
+        cv2.putText(
+            output, f"x={x_rel:.2f} y={y_rel:.2f}", (cx + 8, cy + 14),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1
+        )
 
     cv2.putText(
         output, f"Dice: {len(detections)}" if workspace is not None else "Dice: --",
@@ -364,16 +379,21 @@ def main():
     parser = argparse.ArgumentParser(description="Detect dice and teach camera close-up poses.")
     parser.add_argument("--calibrate", action="store_true",
                         help="Teach camera mapping manually; does not move the robot.")
+    parser.add_argument("--enable-motion", action="store_true",
+                        help="Allow confirmed moves with a taught camera calibration. "
+                             "Default: read-only dice positions, no motion.")
     args = parser.parse_args()
     robot = None
     open_die_windows = set()
-    selection = {"pixel": None}
+    selection = {"pixel": None, "pending": False}
+    selected_window_open = False
     close_up_pose = None
     workspace_visible = None
 
     def select_die(event, x, y, _flags, _param):
         if event == cv2.EVENT_LBUTTONDOWN:
             selection["pixel"] = (x, y)
+            selection["pending"] = True
 
     try:
         robot = NiryoRobot(ROBOT_IP)
@@ -382,11 +402,20 @@ def main():
         if args.calibrate:
             teach_calibration(robot, intrinsics)
             return
-        calibration = load_calibration(intrinsics) if CALIBRATION_FILE.exists() else None
-        if calibration is None:
-            print("Motion disabled: first run this script with --calibrate.")
+        calibration = None
+        if args.enable_motion:
+            if CALIBRATION_FILE.exists():
+                calibration = load_calibration(intrinsics)
+            else:
+                print("Motion disabled: first run this script with --calibrate.")
+        else:
+            print("READ-ONLY: robot motion disabled; no manual camera teaching needed.")
         print("Workspace is detected automatically from all four Niryo ring markers.")
-        print("Click a die | M = confirm close-up | B = confirm return to overview")
+        print("Board coordinates: M1=(0,0), M2=(1,0), M3=(1,1), M4=(0,1).")
+        print("These are image-oriented board coordinates, NOT robot XYZ or millimetres.")
+        print("Click a die to print its pixel centre and board position.")
+        if args.enable_motion:
+            print("M = confirm close-up | B = confirm return to overview")
         print("Q = quit (no automatic return) | R = reset alignment reference | S = save")
         cv2.namedWindow("Dice Detection")
         cv2.setMouseCallback("Dice Detection", select_die)
@@ -421,17 +450,33 @@ def main():
             if not visible:
                 selection["pixel"] = None
             selected = None
+            selected_index = None
             if selection["pixel"] is not None:
-                for die in detections:
+                for index, die in enumerate(detections, start=1):
                     if cv2.pointPolygonTest(
                         die["contour"], selection["pixel"], False
                     ) >= 0:
                         selected = die
+                        selected_index = index
                         break
+            if selection["pending"]:
+                if selected is None:
+                    print("No detected die at the click; all four markers must be visible.")
+                else:
+                    x_rel, y_rel = selected["workspace_position"]
+                    print(
+                        f"Die {selected_index}: pixel centre={selected['center']}, "
+                        f"board x={x_rel:.4f}, y={y_rel:.4f} (relative, not robot XYZ)."
+                    )
+                selection["pending"] = False
             output = draw_detections(frame, detections, workspace)
             if selected is not None:
                 cv2.drawContours(output, [selected["contour"]], -1, (0, 255, 255), 3)
                 cv2.imshow("Selected Die", selected["warped"])
+                selected_window_open = True
+            elif selected_window_open:
+                cv2.destroyWindow("Selected Die")
+                selected_window_open = False
 
             cv2.imshow("Dice Detection", output)
 
@@ -471,6 +516,8 @@ def main():
             elif key == ord("r"):
                 reference_gray = None
                 print("Alignment reference reset.")
+            elif key in (ord("m"), ord("b")) and not args.enable_motion:
+                print("Motion blocked: read-only mode. Only dice positions are enabled.")
             elif key == ord("m"):
                 if workspace is None:
                     print("Motion blocked: all four workspace markers must be visible.")
@@ -498,6 +545,7 @@ def main():
                         cv2.destroyWindow(window_name)
                     open_die_windows.clear()
                     cv2.destroyWindow("Selected Die")
+                    selected_window_open = False
                     print("Close-up view. B = confirmed return; Q leaves the robot here.")
 
     except Exception as e:

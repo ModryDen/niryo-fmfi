@@ -36,12 +36,36 @@ board, not arbitrary boards or generic object recognition.
 The missing-workspace warning is drawn at the bottom of the view so it does not
 cover the upper markers in diagnostic screenshots.
 
+### Automatic positions without robot movement (default)
+
+Run the rectified detector normally, including with VS Code's Run Python File:
+
+```powershell
+.\.venv\Scripts\python.exe .\experiments\vision\dice_object_detection-rectified.py
+```
+
+No five-point manual teaching or saved Workspace in Studio is needed for this
+mode. A perspective transform from the four detected marker centres defines
+normalised board coordinates for each die's image centre:
+`M1=(0,0)`, `M2=(1,0)`, `M3=(1,1)`, `M4=(0,1)`.
+The origin is the image's upper-left marker, X runs towards M2 and Y towards M4.
+Each die shows `x` and `y`; clicking it prints more precise coordinates and its
+original pixel centre in the terminal.
+
+These are estimated planar image positions, **not millimetres, depth or robot
+XYZ**. Object height introduces parallax. Corner labels follow image orientation,
+not encoded physical marker identities; rotating the board can change the origin
+and axes. Die numbers are assigned each frame, not persistent tracking IDs.
+Positions are recomputed from the current frame and disappear if markers are
+lost. The default mode never enables robot motion, does not load a saved motion
+calibration, and blocks both `M` and `B`.
+
 Automatic board detection is **not robot-coordinate calibration** and does not
 make it safe to move the board after teaching. Re-teach the camera mapping after
 changing the board or overview pose. Motion still requires a valid taught
 calibration and explicit confirmation.
 
-## Selecting a die and teaching camera close-ups
+## Optional: selecting a die and teaching camera close-ups
 
 The rectified detector supports click selection and **operator-confirmed** physical
 close-ups. No movement is performed merely by starting the detector or clicking.
@@ -72,10 +96,10 @@ The teaching command reads camera images and tool poses; it does not move the ar
    the independent fifth point (maximum error 5 mm). Different close-up heights
    over 2 mm or orientation differences over 0.02 rad are rejected. The resulting
    local JSON file is ignored by Git.
-6. Manually return to the **original overview pose**, then start normally:
+6. Manually return to the **original overview pose**, then explicitly enable motion:
 
 ```powershell
-.\.venv\Scripts\python.exe .\experiments\vision\dice_object_detection-rectified.py
+.\.venv\Scripts\python.exe .\experiments\vision\dice_object_detection-rectified.py --enable-motion
 ```
 
 Click inside a detected die (yellow outline), then press `M`. The console prints
@@ -146,14 +170,17 @@ Ak kalibrácia zahlási chybu, skontroluj výber bodov, rovnakú výšku a orien
 Po kalibrácii program nevracia robota automaticky. Ručne vráť ho do pôvodnej overview polohy, z ktorej si kalibráciu začal. Kalibračný súbor si ponechaj. Kalibráciu treba zopakovať, ak zmeníš polohu kamery, nástroja alebo dosky, výšku kociek, overview polohu či pracovnú oblasť.
 
 6. Spusti detekciu
-V PowerShelli spusti skript bez prepínača --calibrate:
+V PowerShelli spusti skript bez prepínača --calibrate.
+Predvolene ide o rezim bez pohybu; na potvrdene priblizenie treba --enable-motion:
 
 .\.venv\Scripts\python.exe .\experiments\vision\dice_object_detection-rectified.py
 
-Zobrazí sa obraz kamery a okná s detekovanými kockami. Ak chýba kalibračný súbor, detekcia môže bežať, ale pohyb robota zostane zablokovaný.
+Zobrazí sa obraz kamery a okná s detekovanými kockami a relativnymi suradnicami.
+Bez --enable-motion je pohyb vzdy zablokovany. Aj s tymto prepinacom je potrebna
+platna kalibracia a potvrdenie MOVE.
 
 7. Ovládanie
-Klikaj do hlavného okna Dice Detection:
+Klikaj do hlavného okna Dice Detection. Prikazy M a B vyzaduju --enable-motion:
 
 Klik na detegovanú kocku — vyberie ju.
 M — požiada o priblíženie k vybranej kocke. Skontroluj naplánované polohy a celú dráhu ramena. V termináli napíš MOVE iba vtedy, ak je pohyb bezpečný; čokoľvek iné pohyb zruší.

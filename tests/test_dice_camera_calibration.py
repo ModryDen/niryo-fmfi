@@ -211,7 +211,7 @@ class CalibrationTests(unittest.TestCase):
         robot = Mock()
         frame = workspace_frame()
         with (
-            patch.object(sys, "argv", ["rectified_detector"]),
+            patch.object(sys, "argv", ["rectified_detector", "--enable-motion"]),
             patch.object(detector, "NiryoRobot", return_value=robot),
             patch.object(detector, "CALIBRATION_FILE") as file,
             patch.object(detector, "read_frame", return_value=frame),
@@ -232,6 +232,91 @@ class CalibrationTests(unittest.TestCase):
         detections, workspace = detector.detect_dice(workspace_frame())
         self.assertIsNotNone(workspace)
         self.assertEqual(detections, [])
+
+    def test_normalized_board_positions(self):
+        workspace = detector.detect_workspace(workspace_frame())
+        self.assertIsNotNone(workspace)
+        for pixel, expected in [
+            ((100, 80), (0, 0)), ((540, 80), (1, 0)),
+            ((540, 420), (1, 1)), ((100, 420), (0, 1)),
+            ((320, 250), (0.5, 0.5)), ((210, 165), (0.25, 0.25)),
+        ]:
+            np.testing.assert_allclose(workspace.relative_position(pixel), expected, atol=1e-6)
+
+    def test_positions_use_perspective_not_bounding_rectangle(self):
+        corners = np.array([(130, 70), (500, 100), (550, 410), (80, 380)],
+                           dtype=np.float32)
+        relative = np.array([[[0.25, 0.75]]], dtype=np.float32)
+        forward = cv2.getPerspectiveTransform(
+            np.array([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=np.float32), corners
+        )
+        pixel = cv2.perspectiveTransform(relative, forward)[0, 0]
+        workspace = detector.detect_workspace(workspace_frame(
+            [tuple(map(int, point)) for point in corners]
+        ))
+        self.assertIsNotNone(workspace)
+        np.testing.assert_allclose(
+            workspace.relative_position(pixel), (0.25, 0.75), atol=1e-6
+        )
+
+    def test_detected_dice_include_board_position(self):
+        frame = workspace_frame()
+        cv2.rectangle(frame, (300, 230), (340, 270), (10, 10, 10), -1)
+        dice, _ = detector.detect_dice(frame)
+        self.assertEqual(len(dice), 1)
+        np.testing.assert_allclose(dice[0]["workspace_position"], (0.5, 0.5), atol=1e-6)
+
+    def test_default_mode_cannot_move_even_with_saved_calibration(self):
+        robot = Mock()
+        with (
+            patch.object(sys, "argv", ["rectified_detector"]),
+            patch.object(detector, "NiryoRobot", return_value=robot),
+            patch.object(detector, "CALIBRATION_FILE") as file,
+            patch.object(detector, "load_calibration") as load,
+            patch.object(detector, "read_frame", return_value=workspace_frame()),
+            patch.object(detector.cv2, "namedWindow"),
+            patch.object(detector.cv2, "setMouseCallback"),
+            patch.object(detector.cv2, "imshow"),
+            patch.object(detector.cv2, "destroyAllWindows"),
+            patch.object(detector.cv2, "waitKey",
+                         side_effect=[ord("m"), ord("b"), ord("q")]),
+            patch.object(detector, "confirmed_move") as move,
+        ):
+            file.exists.return_value = True
+            detector.main()
+        file.exists.assert_not_called()
+        load.assert_not_called()
+        move.assert_not_called()
+        robot.get_pose.assert_not_called()
+        robot.set_arm_max_velocity.assert_not_called()
+        robot.move_linear_pose.assert_not_called()
+
+    def test_click_reports_relative_position_without_motion(self):
+        frame = workspace_frame()
+        cv2.rectangle(frame, (300, 230), (340, 270), (10, 10, 10), -1)
+        robot = Mock()
+
+        def click_center(_window, callback):
+            callback(cv2.EVENT_LBUTTONDOWN, 320, 250, 0, None)
+
+        with (
+            patch.object(sys, "argv", ["rectified_detector"]),
+            patch.object(detector, "NiryoRobot", return_value=robot),
+            patch.object(detector, "read_frame", return_value=frame),
+            patch.object(detector.cv2, "namedWindow"),
+            patch.object(detector.cv2, "setMouseCallback", side_effect=click_center),
+            patch.object(detector.cv2, "imshow"),
+            patch.object(detector.cv2, "destroyAllWindows"),
+            patch.object(detector.cv2, "waitKey", return_value=ord("q")),
+            patch("builtins.print") as output,
+        ):
+            detector.main()
+        messages = [str(call.args[0]) for call in output.call_args_list if call.args]
+        self.assertIn(
+            "Die 1: pixel centre=(320, 250), board x=0.5000, y=0.5000 "
+            "(relative, not robot XYZ).", messages
+        )
+        robot.move_linear_pose.assert_not_called()
 
     def test_missing_or_extra_markers_do_not_fall_back_to_fixed_roi(self):
         for corners in [
@@ -326,7 +411,7 @@ class CalibrationTests(unittest.TestCase):
         robot = Mock()
         frame = workspace_frame([])
         with (
-            patch.object(sys, "argv", ["rectified_detector"]),
+            patch.object(sys, "argv", ["rectified_detector", "--enable-motion"]),
             patch.object(detector, "NiryoRobot", return_value=robot),
             patch.object(detector, "CALIBRATION_FILE") as file,
             patch.object(detector, "load_calibration", return_value=self.mapping),
