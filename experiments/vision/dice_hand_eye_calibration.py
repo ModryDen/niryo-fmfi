@@ -10,6 +10,7 @@ from pyniryo import NiryoRobot
 
 from dice_camera_calibration import read_frame
 from dice_workspace import detect_workspace
+from dice_robot_kinematics import RobotKinematics, read_robot_parameters
 
 
 ROBOT_IP = "169.254.200.200"
@@ -128,15 +129,15 @@ def solve_hand_eye(base_tools, camera_boards):
     return require_transform(transform(rotation, translation))
 
 
-def fit_samples(samples, size_m):
+def fit_samples(samples, size_m, *, frame_key="base_tool", allow_joint6=False):
     if len(samples) < MIN_SAMPLES:
         raise ValueError("Need at least 8 views: 6 training views plus 2 independent checks.")
-    base_tools = [require_transform(sample["base_tool"]) for sample in samples]
+    base_tools = [require_transform(sample[frame_key]) for sample in samples]
     camera_boards = [require_transform(sample["camera_board"]) for sample in samples]
     joints = np.array([sample["joints"] for sample in samples], dtype=float)
     if joints.shape != (len(samples), 6) or not np.isfinite(joints).all():
         raise ValueError("Each view must contain six finite joint angles.")
-    if np.max(np.abs(joints[:, 5] - joints[0, 5])) > JOINT6_LIMIT:
+    if not allow_joint6 and np.max(np.abs(joints[:, 5] - joints[0, 5])) > JOINT6_LIMIT:
         raise ValueError("Joint 6 changed. Keep it fixed during capture and future use.")
     train_count = len(samples) - 2
     tool_camera = solve_hand_eye(base_tools[:train_count], camera_boards[:train_count])
@@ -161,7 +162,7 @@ def fit_samples(samples, size_m):
                 f"{np.rad2deg(angle):.1f} deg. Check board movement, corner labels, "
                 "camera rigidity and pose diversity. Calibration NOT saved."
             )
-    return {
+    result = {
         "version": 1,
         "status": "geometry_checked_not_motion_approved",
         "motion_enabled": False,
@@ -174,9 +175,85 @@ def fit_samples(samples, size_m):
         "validation_views": 2,
         "view_errors": errors,
     }
+    if allow_joint6:
+        result["version"] = 2
+        result.pop("required_joint6_rad")
+        result["reference_frame"] = "wrist_link" if frame_key == "base_wrist" else "tool_link"
+        result["reference_from_camera"] = result.pop("tool_from_camera")
+    return result
 
 
-def capture_sample(robot, intrinsics, size_m, samples):
+def fit_automatic(samples, size_m, model):
+    if len(samples) < MIN_SAMPLES:
+        raise ValueError("Need at least 8 distinct stopped views.")
+    for sample in samples:
+        checked = model.checked_wrist(sample["joints"], require_transform(sample["base_tool"]))
+        if not np.allclose(checked, require_transform(sample["base_wrist"]), atol=1e-8):
+            raise ValueError("Saved wrist pose does not match the robot model.")
+    joints = np.asarray([sample["joints"] for sample in samples])
+    if (
+        np.ptp(joints[:-2, 5]) < np.deg2rad(12)
+        or np.ptp(joints[-2:, 5]) < np.deg2rad(8)
+    ):
+        raise ValueError(
+            "More joint-6 variation needed to distinguish camera mounts: "
+            "12 deg across training views, 8 deg between the last two check views. "
+            "Continue different safe overview poses; no precise joint setting is needed."
+        )
+    results = []
+    reasons = []
+    for key in ("base_tool", "base_wrist"):
+        try:
+            result = fit_samples(samples, size_m, frame_key=key, allow_joint6=True)
+        except ValueError as error:
+            reasons.append(f"{key}: {error}")
+        else:
+            results.append(result)
+    if len(results) != 1:
+        if results:
+            raise ValueError("Both camera mounts fit: ambiguous. Record more diverse views.")
+        raise ValueError("Neither camera mount fits. " + " | ".join(reasons))
+    result = results[0]
+    if result["reference_frame"] == "wrist_link":
+        result["reference_frame"] = model.wrist_frame
+    result["robot_description"] = model.description
+    result["mount_selection"] = "one_model_passed_all_views_and_two_holdouts"
+    result["rejected_model_reason"] = reasons
+    return result
+
+
+class StableView:
+    def __init__(self):
+        self.anchor = None
+        self.since = 0.0
+        self.captured = False
+
+    def ready(self, pose, joints, corners, now):
+        if corners is None:
+            self.anchor = None
+            self.captured = False
+            return False
+        current = (np.asarray(pose), np.asarray(joints), np.asarray(corners))
+        changed = self.anchor is None
+        if self.anchor is not None:
+            delta = np.linalg.inv(self.anchor[0]) @ current[0]
+            changed = (
+                np.linalg.norm(delta[:3, 3]) > 0.0005
+                or rotation_angle(delta[:3, :3]) > 0.002
+                or np.max(np.abs(current[1] - self.anchor[1])) > 0.002
+                or np.max(np.linalg.norm(current[2] - self.anchor[2], axis=1)) > 1.5
+            )
+        if changed:
+            self.anchor = tuple(value.copy() for value in current)
+            self.since = now
+            self.captured = False
+        if not self.captured and now - self.since >= 1.5:
+            self.captured = True
+            return True
+        return False
+
+
+def capture_sample(robot, intrinsics, size_m, samples, model=None):
     before = pose_transform(robot.get_pose().to_list())
     joints_before = np.asarray(robot.get_joints(), dtype=float)
     first_frame = read_frame(robot, intrinsics)
@@ -202,7 +279,7 @@ def capture_sample(robot, intrinsics, size_m, samples):
     if samples:
         if list(frame.shape[1::-1]) != samples[0]["image_size"]:
             raise ValueError("Camera resolution changed; restart capture.")
-        if abs(joints[5] - samples[0]["joints"][5]) > JOINT6_LIMIT:
+        if model is None and abs(joints[5] - samples[0]["joints"][5]) > JOINT6_LIMIT:
             raise ValueError("Joint 6 changed. Restore its original value before capturing.")
         for sample in samples:
             relative = np.linalg.inv(np.asarray(sample["base_tool"])) @ after
@@ -212,7 +289,7 @@ def capture_sample(robot, intrinsics, size_m, samples):
             ):
                 raise ValueError("Duplicate view. Use a different safe overview pose.")
     camera_board, error = estimate_board_pose(workspace.corners, intrinsics[0], size_m)
-    return {
+    result = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "base_tool": after.tolist(),
         "camera_board": camera_board.tolist(),
@@ -221,6 +298,9 @@ def capture_sample(robot, intrinsics, size_m, samples):
         "image_size": list(frame.shape[1::-1]),
         "reprojection_rmse_px": error,
     }
+    if model is not None:
+        result["base_wrist"] = model.checked_wrist(joints, after).tolist()
+    return result
 
 
 def write_json(path, data):
@@ -236,16 +316,20 @@ def main():
     parser = argparse.ArgumentParser(description="Read-only non-contact hand-eye calibration.")
     parser.add_argument("--board-size-mm", type=float, default=170,
                         help="Measured marker-centre square side in mm (default: 170).")
+    parser.add_argument("--auto", action="store_true",
+                        help="Auto-record stopped views and fit camera mount; "
+                             "user moves arm, script NEVER commands motion.")
     args = parser.parse_args()
     size_m = args.board_size_mm / 1000
     board_points(size_m)
     print(
         f"READ-ONLY hand-eye capture. Marker-centre square: {args.board_size_mm:g} mm.\n"
         "No script-controlled motion. Use Studio for safe overview poses ONLY.\n"
-        "Keep board, camera mounting and tool fixed. Keep joint 6 at its original angle.\n"
+        "Keep board, camera mounting and tool fixed.\n"
         "Keep M1-M4 on the SAME physical markers; avoid large camera roll.\n"
         "Collect 6+ diverse views with rotations about TWO axes; last 2 views are checks.\n"
-        "Stop manual control and wait at least one second before C.\n"
+        "Manual mode: keep joint 6 fixed; stop and wait before pressing C.\n"
+        "With --auto: no fixed joint-6 angle; stop for 1.5 s for automatic capture.\n"
         "C = capture | U = undo | F = fit/check/save | Q = quit.\n"
         "Do not descend towards or touch the board. No movement is enabled by the result."
     )
@@ -253,12 +337,24 @@ def main():
         return
     robot = None
     samples = []
+    model = None
+    stable = StableView()
+    last_message = None
     try:
         robot = NiryoRobot(ROBOT_IP)
         status = robot.get_hardware_status()
         if status.calibration_needed or status.calibration_in_progress:
             raise ValueError("Finish joint calibration in Studio before recording.")
         intrinsics = robot.get_camera_intrinsics()
+        if args.auto:
+            parameters = read_robot_parameters(ROBOT_IP)
+            if parameters["/niryo_robot_vision/undistort_stream"] is not False:
+                raise ValueError("Expected raw camera stream; avoid double undistortion.")
+            model = RobotKinematics(parameters["/robot_description"])
+            model.checked_wrist(robot.get_joints(), pose_transform(robot.get_pose().to_list()))
+            print("AUTO RECORD: move only by hand/Studio, then stop. No C/F needed.")
+            print("Joint 6 may change. Different tilts and wrist turns are needed; "
+                  "all four markers must stay visible and keep their labels.")
         initial_joint6 = robot.get_joints()[5]
         metadata = {
             "hardware_version": status.hardware_version,
@@ -266,9 +362,13 @@ def main():
             "camera_matrix": np.asarray(intrinsics[0]).tolist(),
             "distortion": np.asarray(intrinsics[1]).tolist(),
             "initial_joint6_rad": initial_joint6,
+            "capture_mode": "automatic_read_only" if args.auto else "manual_read_only",
         }
+        if model is not None:
+            metadata["robot_description"] = model.description
         write_json(SAMPLES, {**metadata, "status": "unvalidated", "samples": samples})
-        print("Joint 6 initial angle:", initial_joint6, "rad. Keep this value.")
+        if not args.auto:
+            print("Joint 6 initial angle:", initial_joint6, "rad. Keep this value.")
         while True:
             frame = read_frame(robot, intrinsics)
             workspace = detect_workspace(frame)
@@ -278,23 +378,37 @@ def main():
                     point = tuple(map(int, corner))
                     cv2.putText(frame, f"M{index}", point,
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            label = f"READ ONLY | views: {len(samples)} | C capture, U undo, F finish, Q quit"
+            mode = "AUTO RECORD" if args.auto else "READ ONLY"
+            label = f"{mode} | views: {len(samples)} | C capture, U undo, F finish, Q quit"
             cv2.putText(frame, label, (8, frame.shape[0] - 18),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
             cv2.imshow("Hand-eye calibration - no automatic motion", frame)
             key = cv2.waitKey(20) & 0xFF
+            if args.auto and key not in (ord("q"), ord("u"), ord("f")):
+                pose = pose_transform(robot.get_pose().to_list())
+                joints = robot.get_joints()
+                if stable.ready(pose, joints,
+                                workspace.corners if workspace is not None else None,
+                                time.monotonic()):
+                    key = ord("c")
             if key == ord("q"):
                 print(f"Stopped. Unvalidated observations remain at {SAMPLES}")
                 break
             if key == ord("c"):
                 try:
-                    sample = capture_sample(robot, intrinsics, size_m, samples)
-                    if abs(sample["joints"][5] - initial_joint6) > JOINT6_LIMIT:
+                    sample = capture_sample(robot, intrinsics, size_m, samples, model) if args.auto else (
+                        capture_sample(robot, intrinsics, size_m, samples)
+                    )
+                    if not args.auto and abs(sample["joints"][5] - initial_joint6) > JOINT6_LIMIT:
                         raise ValueError("Restore joint 6 to its session-start angle.")
                 except (ValueError, cv2.error) as error:
-                    print(f"Capture rejected: {error}")
+                    message = f"Capture rejected: {error}"
+                    if message != last_message:
+                        print(message)
+                        last_message = message
                     continue
                 samples.append(sample)
+                last_message = None
                 print(f"View {len(samples)} captured; reprojection RMSE "
                       f"{sample['reprojection_rmse_px']:.2f} px.")
             elif key == ord("u"):
@@ -303,9 +417,11 @@ def main():
                     print(f"Removed last view. Remaining: {len(samples)}")
                 else:
                     print("No views to remove.")
-            elif key == ord("f"):
+            if key in (ord("c"), ord("u")):
+                write_json(SAMPLES, {**metadata, "status": "unvalidated", "samples": samples})
+            if key == ord("f") or (args.auto and key == ord("c") and len(samples) >= MIN_SAMPLES):
                 try:
-                    result = fit_samples(samples, size_m)
+                    result = fit_automatic(samples, size_m, model) if args.auto else fit_samples(samples, size_m)
                 except (ValueError, cv2.error, np.linalg.LinAlgError) as error:
                     print(f"Calibration rejected: {error}")
                     continue
@@ -314,8 +430,6 @@ def main():
                 print("This result does NOT enable motion. Independent physical validation "
                       "and a collision-safe approach are still required.")
                 break
-            if key in (ord("c"), ord("u")):
-                write_json(SAMPLES, {**metadata, "status": "unvalidated", "samples": samples})
     finally:
         cv2.destroyAllWindows()
         if robot is not None:

@@ -7,7 +7,7 @@ Using computer vision and image processing to detect, count, and sort dice using
 ## Setup
 
 ```bash
-pip install pyniryo==1.1.2 numpy opencv-python
+pip install -r requirements.txt
 ```
 
 After powering on the robot, run `calibration.py` to calibrate it before operating the robot!
@@ -66,6 +66,49 @@ changing the board or overview pose. Motion still requires a valid taught
 calibration and explicit confirmation.
 
 ## Non-contact camera-to-arm calibration (read-only)
+
+### Automatic recording, no fixed Joint 6
+
+```powershell
+.\.venv\Scripts\python.exe .\experiments\vision\dice_hand_eye_calibration.py --auto
+```
+
+Type `CAPTURE`, then use hand-guiding/Studio to choose safe overview poses.
+The script does **not** move the arm or enable learning mode. Stop and release
+manual control for at least 1.5 seconds at each pose; it automatically records
+a stable view and, after at least eight views, attempts a fit. No `C`/`F` is
+needed. You still need genuinely different orientations about two axes, with
+all four markers visible and on the same labels; keep the board fixed and stay
+clear of it. Recording pauses/rejects observations when visibility, image quality
+or stability is insufficient.
+
+Joint 6 is the last wrist rotation before the gripper, not gripper opening.
+You do not need to hold it fixed in `--auto`. Instead, the program reads the
+robot's actual URDF through the ROS bridge (`websocket-client`, TCP 9090),
+computes the wrist pose, and checks its tool kinematics against the reported
+robot pose (2 mm / 0.02 rad maximum disagreement). It also verifies the camera
+stream is not already undistorted. Missing/incompatible models or ROS failures
+block calibration; there is no hardcoded camera offset or automatic fallback.
+
+The program tries a camera fixed relative to `tool_link` and one fixed relative
+to the parent of `joint_6`. It only selects a mount if **exactly one** passes all
+geometry/held-out checks. To distinguish these hypotheses it requires at least
+12 degrees of joint-6 span in the training views and 8 degrees between the last
+two check views. This is measured automatically; no precise angle setting is
+needed. If more variety is needed, the console explains why; continue taking
+different safe overview poses. `U` removes the last observation, `Q` exits.
+
+Auto results use schema version 2: `reference_frame` names the selected link and
+`reference_from_camera` maps camera coordinates into it. The exact robot model
+is stored with the result, alongside the board pose, observations and validation
+errors. Camera mounting must not change. This supports only the two tested
+mount hypotheses; inconsistent or ambiguous data are rejected. Geometric
+consistency is not proof of absolute accuracy or collision safety.
+
+**Automatic recording/calculation is not automatic robot movement.** The result
+remains `motion_enabled: false` and is not wired into the detector's movement.
+
+### Legacy manual recording
 
 Run [dice_hand_eye_calibration.py](experiments/vision/dice_hand_eye_calibration.py)
 with VS Code's Run Python File, or:

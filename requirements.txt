@@ -1,0 +1,4 @@
+pyniryo==1.1.2
+numpy
+opencv-python
+websocket-client>=1.8,<2
