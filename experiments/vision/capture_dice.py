@@ -1,132 +1,217 @@
 
-from pyniryo import NiryoRobot
-from pyniryo.vision import uncompress_image
-
-import cv2
-import time
 from pathlib import Path
 from datetime import datetime
 
+import cv2
+import numpy as np
+from pyniryo import NiryoRobot
+
+
 ROBOT_IP = "169.254.200.200"
-OUTPUT_DIR = Path("captured_dice")
+SAVE_DIR = Path("dice_photos")
 
-MIN_AREA = 1500
-MAX_AREA = 100000
-SAVE_INTERVAL = 1.5
-
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-robot = None
-last_save_time = 0
+MIN_AREA = 300
+MAX_AREA = 50000
+MIN_ASPECT = 0.65
+MAX_ASPECT = 1.35
 
 
-def find_dice_candidates(img):
-    """
-    Find approximately square/rectangular objects.
-    Detection uses a processed copy; the original image is unchanged.
-    """
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blurred, 50, 150)
+def get_camera_image(robot):
+    compressed = robot.get_img_compressed()
+
+    if isinstance(compressed, tuple):
+        compressed = compressed[-1]
+
+    if isinstance(compressed, np.ndarray):
+        compressed = compressed.tobytes()
+
+    data = np.frombuffer(compressed, dtype=np.uint8)
+    image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+
+    if image is None:
+        raise RuntimeError("Nepodarilo sa načítať obraz z kamery.")
+
+    return image
+
+
+def detect_cubes(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    # Detekcia hrán – iba na rozpoznávanie objektov.
+    edges = cv2.Canny(gray, 50, 150)
 
     contours, _ = cv2.findContours(
-        edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        edges,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
     )
 
-    candidates = []
+    detections = []
 
     for contour in contours:
         area = cv2.contourArea(contour)
 
-        if not MIN_AREA <= area <= MAX_AREA:
+        if area < MIN_AREA or area > MAX_AREA:
             continue
 
         perimeter = cv2.arcLength(contour, True)
-        approx = cv2.approxPolyDP(
-            contour, 0.04 * perimeter, True
+
+        if perimeter == 0:
+            continue
+
+        polygon = cv2.approxPolyDP(
+            contour,
+            0.04 * perimeter,
+            True
         )
 
-        if len(approx) < 4 or len(approx) > 6:
+        # Kocka musí mať približne štyri viditeľné strany.
+        if len(polygon) != 4:
             continue
 
-        x, y, w, h = cv2.boundingRect(approx)
+        x, y, w, h = cv2.boundingRect(polygon)
 
-        if h == 0 or w == 0:
+        if h == 0:
             continue
 
-        aspect_ratio = w / h
+        aspect = w / h
 
-        if not 0.65 <= aspect_ratio <= 1.45:
+        if not MIN_ASPECT <= aspect <= MAX_ASPECT:
             continue
 
-        candidates.append((x, y, w, h))
+        # Kontrola približne štvorcového tvaru.
+        rect_area = w * h
 
-    return candidates
-
-
-try:
-    robot = NiryoRobot(ROBOT_IP)
-    print("Connected to Niryo NED.")
-    print("Saving raw images when dice-like objects are detected.")
-    print("Press Q to quit.")
-
-    while True:
-        img_compressed = robot.get_img_compressed()
-        img_raw = uncompress_image(img_compressed)
-
-        if img_raw is None:
-            print("Could not decode camera image.")
-            time.sleep(0.2)
+        if rect_area == 0:
             continue
 
-        candidates = find_dice_candidates(img_raw)
-        now = time.time()
+        fill_ratio = area / rect_area
 
-        if candidates and now - last_save_time >= SAVE_INTERVAL:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            frame_path = OUTPUT_DIR / f"dice_{timestamp}.png"
+        if fill_ratio < 0.45:
+            continue
 
-            # Save the original, unmodified camera frame.
-            cv2.imwrite(str(frame_path), img_raw)
+        detections.append((x, y, w, h))
 
-            # Save individual candidate crops from the original frame.
-            for index, (x, y, w, h) in enumerate(candidates):
-                crop = img_raw[y:y + h, x:x + w]
+    # Odstránenie duplicitných a prekrývajúcich sa detekcií.
+    detections.sort(key=lambda item: item[2] * item[3], reverse=True)
 
-                if crop.size:
-                    crop_path = OUTPUT_DIR / (
-                        f"dice_{timestamp}_crop_{index}.png"
-                    )
-                    cv2.imwrite(str(crop_path), crop)
+    filtered = []
 
-            print(
-                f"Detected {len(candidates)} candidate(s). "
-                f"Saved: {frame_path}"
+    for candidate in detections:
+        x, y, w, h = candidate
+
+        duplicate = False
+
+        for fx, fy, fw, fh in filtered:
+            ix1 = max(x, fx)
+            iy1 = max(y, fy)
+            ix2 = min(x + w, fx + fw)
+            iy2 = min(y + h, fy + fh)
+
+            intersection = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+
+            if intersection > 0.5 * min(w * h, fw * fh):
+                duplicate = True
+                break
+
+        if not duplicate:
+            filtered.append(candidate)
+
+    return filtered
+
+
+def save_cubes(frame, detections):
+    SAVE_DIR.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+    for index, (x, y, w, h) in enumerate(detections, start=1):
+        # Malá rezerva okolo kocky.
+        padding = 8
+
+        x1 = max(0, x - padding)
+        y1 = max(0, y - padding)
+        x2 = min(frame.shape[1], x + w + padding)
+        y2 = min(frame.shape[0], y + h + padding)
+
+        # Výrez z pôvodnej farebnej fotografie.
+        cube_photo = frame[y1:y2, x1:x2]
+
+        filename = SAVE_DIR / f"cube_{timestamp}_{index}.png"
+
+        cv2.imwrite(str(filename), cube_photo)
+
+        print(f"Uložená kocka: {filename}")
+
+
+def main():
+    robot = None
+
+    try:
+        robot = NiryoRobot(ROBOT_IP)
+        print("ROBOT CONNECTED")
+
+        print("S = uložiť nájdené kocky")
+        print("Q = ukončiť")
+
+        while True:
+            frame = get_camera_image(robot)
+
+            detections = detect_cubes(frame)
+
+            preview = frame.copy()
+
+            for index, (x, y, w, h) in enumerate(detections, start=1):
+                cv2.rectangle(
+                    preview,
+                    (x, y),
+                    (x + w, y + h),
+                    (0, 255, 0),
+                    2
+                )
+
+                cv2.putText(
+                    preview,
+                    f"Cube {index}",
+                    (x, y - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 0),
+                    2
+                )
+
+            cv2.putText(
+                preview,
+                f"Detected cubes: {len(detections)}",
+                (15, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 255, 255),
+                2
             )
 
-            last_save_time = now
+            cv2.imshow("Niryo - Cube Detection", preview)
 
-        # Display a copy with candidate boxes; never save this display.
-        display = img_raw.copy()
+            key = cv2.waitKey(1) & 0xFF
 
-        for x, y, w, h in candidates:
-            cv2.rectangle(
-                display, (x, y), (x + w, y + h),
-                (0, 255, 0), 2
-            )
+            if key == ord("s"):
+                save_cubes(frame, detections)
 
-        cv2.imshow("Dice detection (Q to quit)", display)
+            elif key == ord("q"):
+                break
 
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
+    except Exception as error:
+        print("ERROR:")
+        print(f"{type(error).__name__}: {error}")
 
-except Exception as e:
-    print(f"Error: {e}")
+    finally:
+        cv2.destroyAllWindows()
 
-finally:
-    cv2.destroyAllWindows()
+        if robot is not None:
+            robot.close_connection()
 
-    if robot is not None:
-        robot.close_connection()
+        print("Connection closed.")
 
-    print("Capture stopped.")
+
+if __name__ == "__main__":
+    main()
