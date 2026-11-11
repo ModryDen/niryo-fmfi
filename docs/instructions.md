@@ -1,5 +1,7 @@
 # Triedenie pasteliek
 
+hehe 
+
 Robotické rameno Niryo NED sa pripája k notebooku cez ethernetový kábel. Jeho IP adresa je `169.254.200.200`.
 
 ## Napájanie a zapojenie
