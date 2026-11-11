@@ -7,13 +7,18 @@ import cv2
 
 from dice_camera_calibration import (
     CALIBRATION_FILE,
+    OVERVIEW_ANGLE_TOLERANCE,
     confirmed_move,
     load_calibration,
     read_frame,
+    require_live_camera,
     require_pose,
     teach_calibration,
 )
 from dice_workspace import detect_workspace, find_ring_markers, order_corners
+from dice_pick_place import (
+    PICK_FILE, load_pick_calibration, teach_pick_calibration, repair_pick_calibration, pick_and_place, PickupPreflightError, load_taught_target, refresh_fixed_reference,
+)
 
 ROBOT_IP = "169.254.200.200"
 
@@ -231,6 +236,12 @@ def draw_detections(frame, detections, workspace):
             workspace.mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
         cv2.drawContours(output, contours, -1, (255, 255, 0), 2)
+        cv2.polylines(output, [workspace.corners.astype(np.int32)], True, (255, 200, 0), 2)
+        for index, midpoint in enumerate(workspace.side_points, start=1):
+            point = tuple(np.int32(np.round(midpoint)))
+            cv2.drawMarker(output, point, (255, 200, 0), cv2.MARKER_CROSS, 12, 2)
+            cv2.putText(output, f"S{index}", (point[0] + 8, point[1] + 16),
+                        cv2.FONT_HERSHEY_SIMPLEX, .5, (255, 200, 0), 2)
         for index, corner in enumerate(workspace.corners, start=1):
             point = tuple(map(int, corner))
             cv2.circle(output, point, 5, (0, 255, 255), -1)
@@ -264,6 +275,19 @@ def draw_detections(frame, detections, workspace):
     return output
 
 
+
+def draw_taught_target(output, target):
+    """Show the fixed taught pickup location; never alter detector input pixels."""
+    point = tuple(np.rint(target.pixel).astype(int))
+    color = (0, 200, 255)
+    cv2.drawMarker(output, point, color, cv2.MARKER_CROSS, 26, 2)
+    cv2.circle(output, point, 5, color, 1)
+    cv2.putText(output, f'TAUGHT {target.number}', (point[0] + 16, point[1] - 20),
+                cv2.FONT_HERSHEY_SIMPLEX, .55, color, 2)
+    cv2.putText(output, 'Fixed target: place die centre on orange cross (arm stationary)',
+                (10, output.shape[0] - 40), cv2.FONT_HERSHEY_SIMPLEX, .43, color, 1)
+
+
 def main():
     global reference_gray
 
@@ -271,9 +295,23 @@ def main():
     parser.add_argument("--calibrate", action="store_true",
                         help="Teach camera mapping manually; does not move the robot.")
     parser.add_argument("--enable-motion", action="store_true",
-                        help="Allow confirmed moves with a taught camera calibration. "
+                        help="Allow confirmed moves with the relevant taught calibration. "
                              "Default: read-only dice positions, no motion.")
+    parser.add_argument("--teach-pick", action="store_true",
+                        help="Manually teach gripper pickup and one drop pose; no motion commands.")
+    parser.add_argument("--repair-pick", action="store_true",
+                        help="Correct individual saved pickup records manually; no motion commands.")
+    parser.add_argument("--taught-target", type=int, choices=range(1, 6),
+                        help="Use one fixed taught die pose directly, without camera mapping interpolation.")
+    parser.add_argument("--refresh-fixed-view", action="store_true",
+                        help="Confirm unchanged setup and record marker reference for this fixed-target session only.")
     args = parser.parse_args()
+    if args.refresh_fixed_view and args.taught_target is None:
+        parser.error("--refresh-fixed-view requires --taught-target.")
+    if args.taught_target is not None and not args.enable_motion:
+        parser.error("--taught-target requires --enable-motion.")
+    if sum((args.calibrate, args.teach_pick, args.repair_pick)) > 1:
+        parser.error("Choose only one teaching/repair mode.")
     robot = None
     open_die_windows = set()
     selection = {"pixel": None, "pending": False}
@@ -290,15 +328,37 @@ def main():
         robot = NiryoRobot(ROBOT_IP)
         print("ROBOT CONNECTED")
         intrinsics = robot.get_camera_intrinsics()
+        if args.repair_pick:
+            repair_pick_calibration(robot, intrinsics)
+            return
+        if args.teach_pick:
+            teach_pick_calibration(robot, intrinsics)
+            return
         if args.calibrate:
             teach_calibration(robot, intrinsics)
             return
+        pick_calibration = None
+        if args.enable_motion and args.taught_target is not None:
+            pick_calibration = load_taught_target(intrinsics, args.taught_target)
+            if args.refresh_fixed_view:
+                if not refresh_fixed_reference(robot, pick_calibration, intrinsics, ROBOT_IP):
+                    return
+            print(f"FIXED TAUGHT TARGET {args.taught_target}: uses its recorded tool pose directly.")
+            print("Keep that die in its taught position. This mode does not map arbitrary dice positions. Frame Die numbers can change; TAUGHT marks the fixed location.")
+        elif args.enable_motion and PICK_FILE.exists():
+            try:
+                pick_calibration = load_pick_calibration(intrinsics)
+            except (ValueError, KeyError, OSError) as error:
+                print(f"Pickup disabled: {error}")
         calibration = None
         if args.enable_motion:
             if CALIBRATION_FILE.exists():
-                calibration = load_calibration(intrinsics)
+                try:
+                    calibration = load_calibration(intrinsics)
+                except (ValueError, KeyError, OSError) as error:
+                    print(f"Camera close-ups disabled: {error}")
             else:
-                print("Motion disabled: first run this script with --calibrate.")
+                print("Camera close-ups disabled: teach with --calibrate if needed.")
         else:
             print("READ-ONLY: robot motion disabled; no manual camera teaching needed.")
         print("Workspace is detected automatically from all four Niryo ring markers.")
@@ -306,7 +366,9 @@ def main():
         print("These are image-oriented board coordinates, NOT robot XYZ or millimetres.")
         print("Click a die to print its pixel centre and board position.")
         if args.enable_motion:
-            print("M = confirm close-up | B = confirm return to overview")
+            print("M = confirm close-up | B = confirm return | P = pick selected die to taught drop")
+            if pick_calibration is None:
+                print("Pickup needs separate teaching: run with --teach-pick first.")
         print("Q = quit (no automatic return) | R = reset alignment reference | S = save")
         cv2.namedWindow("Dice Detection")
         cv2.setMouseCallback("Dice Detection", select_die)
@@ -361,6 +423,8 @@ def main():
                     )
                 selection["pending"] = False
             output = draw_detections(frame, detections, workspace)
+            if args.taught_target is not None and pick_calibration is not None:
+                draw_taught_target(output, pick_calibration)
             if selected is not None:
                 cv2.drawContours(output, [selected["contour"]], -1, (0, 255, 255), 3)
                 cv2.imshow("Selected Die", selected["warped"])
@@ -407,8 +471,47 @@ def main():
             elif key == ord("r"):
                 reference_gray = None
                 print("Alignment reference reset.")
-            elif key in (ord("m"), ord("b")) and not args.enable_motion:
+            elif key in (ord("m"), ord("b"), ord("p")) and not args.enable_motion:
                 print("Motion blocked: read-only mode. Only dice positions are enabled.")
+            elif key == ord("p"):
+                if pick_calibration is None or workspace is None or selected is None:
+                    print("Pickup blocked: need --teach-pick calibration, four markers and a selected die.")
+                    continue
+                try:
+                    require_live_camera(ROBOT_IP)
+                    pick_calibration.check_board(workspace)
+                    # Validate a fresh frame AFTER terminal confirmation, before any actuator command.
+                    def revalidate():
+                        require_live_camera(ROBOT_IP)
+                        fresh = read_frame(robot, intrinsics)
+                        if fresh.shape != frame.shape:
+                            raise ValueError("Camera resolution changed.")
+                        fresh_dice, fresh_workspace = detect_dice(fresh)
+                        pick_calibration.check_board(fresh_workspace)
+                        if len(fresh_dice) != len(detections):
+                            raise ValueError("Dice changed during confirmation. Select again.")
+                        for old, new in zip(detections, fresh_dice):
+                            if (np.linalg.norm(np.asarray(old["center"]) - new["center"]) > 3
+                                    or abs(new["area"] / old["area"] - 1) > .15):
+                                raise ValueError("Dice moved during confirmation. Select again.")
+                    # Errors after the first actuator command propagate and end the session.
+                    pick_calibration.target(selected["center"], (frame.shape[1], frame.shape[0]))
+                    require_pose(robot.get_pose().to_list(), pick_calibration.overview,
+                                 angle_tolerance=OVERVIEW_ANGLE_TOLERANCE)
+                except ValueError as error:
+                    print(f"Pickup blocked: {error}")
+                    continue
+                try:
+                    completed = pick_and_place(robot, pick_calibration, selected["center"],
+                                               (frame.shape[1], frame.shape[0]), revalidate)
+                except PickupPreflightError as error:
+                    selection["pixel"] = None
+                    print(f"Pickup cancelled before motion: {error}")
+                    print("Camera remains active. Wait for a stable view, then select the die again.")
+                    continue
+                if completed:
+                    selection["pixel"] = None
+                    print("Pick/place commands complete; verify the die was transferred.")
             elif key == ord("m"):
                 if workspace is None:
                     print("Motion blocked: all four workspace markers must be visible.")

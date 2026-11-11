@@ -9,6 +9,14 @@ class Workspace:
     corners: np.ndarray
     mask: np.ndarray
 
+    @property
+    def side_points(self):
+        """Image projections of the four board-side midpoints (not extra markers)."""
+        unit = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=np.float32)
+        matrix = cv2.getPerspectiveTransform(unit, self.corners.astype(np.float32))
+        midpoints = np.array([[[.5, 0], [1, .5], [.5, 1], [0, .5]]], dtype=np.float32)
+        return cv2.perspectiveTransform(midpoints, matrix)[0]
+
     def relative_position(self, pixel):
         destination = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=np.float32)
         transform = cv2.getPerspectiveTransform(

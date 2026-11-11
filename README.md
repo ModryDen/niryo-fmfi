@@ -289,3 +289,160 @@ Q — ukončí program, ale robota nevráti. Ak je robot v detailnej polohe, vr�
 R — resetuje referenčný obrázok na zarovnanie.
 S — uloží binárne obrázky detegovaných kociek do priečinka dice_dataset v aktuálnom pracovnom priečinku.
 Skript nastavuje rýchlosť ramena na 10 % a po skončení ju neobnovuje. Priblíženie je určené na kontrolu obrazu, nie na uchopenie ani triedenie kociek. Tento postup nepredstavuje detekciu kolízií — bezpečnosť celej dráhy musíš vždy overiť ty.
+## Pick a selected die into one taught drop location
+
+The detector shows marker-centre edges and S1-S4: perspective projections of
+side midpoints. These are calculated points, not independently detected markers
+or the physical outer edges of the platform.
+
+Run pickup teaching (separate from camera close-up calibration):
+
+```powershell
+.\.venv\Scripts\python.exe .\experiments\vision\dice_object_detection-rectified.py --teach-pick
+```
+
+Configure a Niryo gripper in Studio. Put five stationary dice of the working
+height on the board: four outer targets and an interior check target. Start at
+an overview pose with all four markers visible, whose Z clears the entire
+transfer route and drop area. Type TEACH PICK; click the five die centres in
+that order, then Enter. In Studio manually centre the GRIPPER at each pickup
+position, keeping the same orientation and pickup Z. Release manual control
+and type RECORD for each target. Teach one drop pose with the same orientation,
+then RECORD DROP. Return manually to the original overview and type CHECK.
+Teaching sends no arm or gripper commands. The independent fifth-point error
+must be at most 5 mm. The local dice_pick_calibration.json is ignored by Git.
+
+```powershell
+.\.venv\Scripts\python.exe .\experiments\vision\dice_object_detection-rectified.py --enable-motion
+```
+
+Click a detected die, press P, check the printed route and type PICK. The program
+rechecks the starting pose, gripper, board and dice before actuating. It opens,
+travels above the die, descends, closes, lifts, travels above the drop, descends,
+opens, lifts and returns to overview. Horizontal travel uses overview Z. Each
+cycle needs selection and confirmation; speed stays at 10%. Camera close-ups
+with M still require their own --calibrate teaching.
+
+Keep the board fixed; marker drift above 3 pixels blocks picking. Re-teach after
+changing the tool, camera, die height or setup. Gripper orientation is fixed,
+not adapted to individual die angles. Use isolated dice with room for the open
+fingers, verify clearance for the whole arm, and clear the drop before each
+cycle. This does not plan collisions or stacking. It does not verify that a die
+was actually grasped or released. A command failure stops without automatic
+recovery or release. Physical accuracy needs validation on the robot; tests
+use a simulated robot and send no hardware commands.
+
+Pickup teaching now saves every recorded pose to dice_pick_draft.json before
+validation, including rejected sessions. This draft does not enable motion.
+Orientation checks compare physical rotations rather than separate Euler angles
+to handle equivalent roll/pitch/yaw values near a vertical tool orientation.
+
+Use --repair-pick to correct a complete saved draft without re-clicking image
+points. This mode backs up the original draft and sends no motion commands.
+Choose 1-5 or D, manually position the gripper in Studio, then RECORD. Invalid
+orientation/height leaves the previous record intact. Corrections save after
+each accepted record. With board and dice still fixed, return to the original
+overview and choose CHECK to validate and save the motion calibration.
+
+In --repair-pick, IMAGE lets you reselect the five original die image centres
+from a fresh frozen frame at the original overview, preserving every robot
+pose and the drop location. Board markers must match the reference and dice
+must not have moved. Keep the original numbering; orange old labels are hints,
+not new detections. Enter saves five new clicks; R resets; Q cancels. CHECK
+still enforces the independent 5 mm error limit before enabling the mapping.
+
+VIEW in pickup repair opens a diagnostic frozen camera frame at any robot
+pose without changing or saving calibration. Original pixel labels are shown
+as hints only; camera pose differences can shift them. Pose errors now report
+position and physical rotation differences, limits, and actual/required poses.
+
+Image repair saves new die centres and marker corners from the same frozen
+frame, preserving the robot teaching. Older repaired mappings should repeat
+IMAGE and CHECK once to refresh this reference. Preflight validation refusals
+after PICK now keep the camera session open without actuating; errors after
+actuation still terminate the session.
+
+REFRESH in repair explicitly re-observes the image mapping when old marker
+image coordinates prevent IMAGE. It requires the original robot overview, all
+four detected markers, and typing SETUP UNCHANGED to attest that the board,
+five dice, robot base and camera/tool mounting have not moved. It saves newly
+clicked centres with marker corners from the same frame; all robot poses stay
+unchanged. Cancel if the physical setup moved. It does not enable motion: CHECK
+still enforces orientation, pickup height, independent fifth-point error, pose
+and marker checks. Normal runtime marker drift protection remains unchanged.
+
+REFRESH can now record the actual nearby camera overview even when its
+orientation differs from the old camera reference. Position must remain within
+2 mm of the previous overview. The original pickup orientation is retained
+separately as pickup_reference_pose; taught grip/drop checks remain unchanged.
+The robot must stay at the new overview during capture and CHECK. Starting
+motion checks this newly recorded pose; pickup targets retain the taught grip
+orientation, with orientation changes occurring on the printed approach route.
+This does not solve robot repeatability or collision planning; inspect the route.
+
+For a first physical trial of one unmoved taught die, --enable-motion
+--taught-target 5 uses target 5 directly from the saved pickup draft. This is
+a fixed-position trial, not a validated image-to-robot mapping. The clicked
+die must remain within 5 pixels of its taught image position. Starting pose,
+board reference, intrinsics, configured gripper and post-confirmation scene
+checks remain active. It uses the full recorded pickup pose, including its
+orientation, and the recorded drop. Click the central die, P, then inspect
+the route and type PICK. Physical grasp/release is not automatically verified.
+Arbitrary die positions still require a validated five-point calibration.
+
+The linear-move adapter handles older Niryo servers that reject the installed
+SDK extra empty frame name with "6 parameters expected but 7 given". Only that
+explicit parameter rejection triggers a six-coordinate MOVE_LINEAR_POSE retry;
+the successful legacy format is reused for the connection. Other motion,
+kinematics and network errors are never retried. SDK packet tests intercept
+the transport and do not connect to or move a robot.
+
+After each linear move, pose feedback is polled for up to three seconds,
+requiring two consecutive readings within the original 2 mm / 0.02 rad limits.
+No motion is resent while waiting. Pick/place also checks hardware status
+before actuating and after each gripper command; reported motor errors block
+further movement. Clear hardware faults in Studio before retrying a cycle.
+
+Pose settling waits up to 3 seconds with the same accuracy limits.
+The trial gripper settings are speed 300, peak effort 30%, holding effort 10%,
+to reduce effort compared with SDK defaults. A successful grasp must still be
+verified physically; these settings are not a guarantee of grip strength.
+Hardware status is checked after every settled arm move as well as gripper
+commands; a delayed reported overload stops descent or the next action.
+
+After joint recalibration, diagnostics/check_empty_approach.py offers an empty
+arm test above taught target 5 and back. It requires a clear overview above
+Z=0.30 m within 20 mm of the saved overview, healthy hardware, Learning Mode
+off, and typing TEST EMPTY ARM. Both endpoints use the starting Z. It sends no
+gripper commands and never descends. Endpoint checks retain 2 mm / 0.02 rad
+limits. A failure stops without an automatic return; results are saved to the
+ignored diagnostics/empty_approach_report.json. Recalibration does not by itself
+validate old pickup calibration or guarantee clearance for the entire arm.
+
+The camera overview start/return check allows up to 2 degrees of orientation
+difference while retaining the 2 mm position limit. This applies only to the
+upper camera pose: pickup, drop, and the approach before descent retain the
+original 0.02 rad angular check. Board-image validation remains mandatory
+before pickup. The empty approach report records each stage angular limit.
+
+The 2-degree angular limit now applies consistently to all upper approaches,
+lifts, transfers and camera returns, including both legs of the empty-arm test.
+Pickup and drop endpoints retain the strict 0.02 rad check immediately before
+gripper actuation. The position limit remains 2 mm everywhere. Pick/place prints
+each movement stage so a stopped cycle can be identified without guessing.
+
+Before pickup planning and again after confirmation, the detector verifies
+the ROS video stream is active and receives two distinct frame headers. A
+cached TCP JPEG is not accepted as proof of live video. This read-only check
+uses websocket-client and ROS bridge port 9090; failure blocks pickup without
+actuating. If streaming is off, restore the camera connection rather than
+moving the board or dice to match an old displayed frame.
+
+For fixed taught-target trials only, --refresh-fixed-view asks for FIXED SETUP
+to attest that the physical board, robot base, camera mounting and taught die
+position are unchanged. It requires healthy hardware, the recorded overview
+pose and a fresh video stream, then observes all four markers as the reference
+for this run. It changes no calibration file or pickup/drop pose. Normal 3-pixel
+marker drift protection applies against this session reference; the selected
+die must still be within 5 pixels of its taught position. It cannot repair a
+physically moved board or recalibrate the camera-to-robot mapping.

@@ -30,3 +30,14 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+dice_pick_calibration.json
+
+dice_pick_draft.json
+dice_pick_draft.json.tmp
+
+dice_pick_draft_backup_*.json
+
+diagnostics/camera/pick_diagnostic.png
+diagnostics/camera/pick_diagnostic.json
+
+diagnostics/empty_approach_report.json
