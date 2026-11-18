@@ -182,3 +182,103 @@ class LiveAlignmentTests(unittest.TestCase):
             pickup.wait_for_preview_pose(self.robot,self.mapping.overview)
         self.assertEqual(wait.call_count,2)
         self.robot.move_linear_pose.assert_not_called()
+
+
+    def test_corrected_yaw_is_preserved_during_vertical_rise(self):
+        def inspect(pose):
+            corrected=pose.copy();corrected[0]+=.003;corrected[5]+=.06
+            self.move(corrected)
+            return corrected
+        with patch('builtins.input',return_value='PREVIEW'),contextlib.redirect_stdout(io.StringIO()):
+            pickup.preview_pick(self.robot,self.mapping,(242,190),(640,480),self.revalidate,
+                                workspace=self.workspace,clearance_mm=30,inspection_callback=inspect)
+        moves=[c.args[0] for c in self.robot.move_linear_pose.call_args_list]
+        self.assertAlmostEqual(moves[2][0],moves[1][0]+.003)
+        self.assertAlmostEqual(moves[2][5],moves[1][5]+.06)
+        self.assertAlmostEqual(moves[2][2],.4)
+        np.testing.assert_allclose(moves[-1],self.mapping.overview)
+        self.robot.close_gripper.assert_not_called()
+
+
+    def test_live_key_waits_for_drifting_feedback_without_resending_move(self):
+        with (patch.object(pickup,'require_live_camera'),
+              patch.object(pickup,'read_frame',return_value=np.zeros((140,640,3),np.uint8)),
+              patch.object(pickup.cv2,'namedWindow'),patch.object(pickup.cv2,'imshow'),
+              patch.object(pickup.cv2,'destroyWindow'),
+              patch.object(pickup.cv2,'getWindowProperty',return_value=1),
+              patch.object(pickup.cv2,'waitKey',side_effect=[ord('s'),ord('q')]),
+              patch.object(pickup,'wait_for_pose',side_effect=[None,ValueError('yaw drift'),None,None]) as wait,
+              patch('builtins.input',return_value='WAIT'),contextlib.redirect_stdout(io.StringIO())):
+            with self.assertRaisesRegex(ValueError,'stopped in place'):
+                pickup.live_inspection(self.robot,self.pose.copy(),None,'robot')
+        self.assertEqual(wait.call_count,4)
+        self.assertEqual(self.robot.move_linear_pose.call_count,1)
+        self.robot.open_gripper.assert_not_called()
+        self.robot.close_gripper.assert_not_called()
+
+    def test_cancelling_wait_before_live_key_sends_no_movement(self):
+        with (patch.object(pickup,'require_live_camera'),
+              patch.object(pickup,'read_frame',return_value=np.zeros((140,640,3),np.uint8)),
+              patch.object(pickup.cv2,'namedWindow'),patch.object(pickup.cv2,'imshow'),
+              patch.object(pickup.cv2,'destroyWindow'),
+              patch.object(pickup.cv2,'getWindowProperty',return_value=1),
+              patch.object(pickup.cv2,'waitKey',return_value=ord('s')),
+              patch.object(pickup,'wait_for_pose',side_effect=[None,ValueError('yaw drift')]),
+              patch('builtins.input',return_value='STOP'),contextlib.redirect_stdout(io.StringIO())):
+            with self.assertRaisesRegex(ValueError,'yaw drift'):
+                pickup.live_inspection(self.robot,self.pose.copy(),None,'robot')
+        self.robot.move_linear_pose.assert_not_called()
+
+
+    def test_plain_live_preview_allows_yaw_without_training_callback(self):
+        origin=self.pose.copy()
+        with (patch.object(pickup,'require_live_camera'),
+              patch.object(pickup,'read_frame',return_value=np.zeros((140,640,3),np.uint8)),
+              patch.object(pickup.cv2,'namedWindow'),patch.object(pickup.cv2,'imshow'),
+              patch.object(pickup.cv2,'destroyWindow'),
+              patch.object(pickup.cv2,'getWindowProperty',return_value=1),
+              patch.object(pickup.cv2,'waitKey',side_effect=[ord('j'),ord('q')]),
+              patch.object(pickup,'wait_for_pose'),contextlib.redirect_stdout(io.StringIO())):
+            with self.assertRaisesRegex(ValueError,'stopped in place'):
+                pickup.live_inspection(self.robot,origin,None,'robot')
+        self.assertEqual(self.robot.move_linear_pose.call_count,1)
+        target=self.robot.move_linear_pose.call_args.args[0]
+        np.testing.assert_array_equal(target[:5],origin[:5])
+        self.assertAlmostEqual(target[5],origin[5]-np.deg2rad(2))
+        self.robot.close_gripper.assert_not_called()
+
+    def test_half_degree_yaw_step_and_invalid_steps(self):
+        origin=self.pose.copy()
+        target=pickup.alignment_turn(origin,origin,1,step_deg=.5)
+        self.assertAlmostEqual(target[5]-origin[5],np.deg2rad(.5))
+        np.testing.assert_array_equal(target[:5],origin[:5])
+        for step in (0,3,float('nan'),True):
+            with self.assertRaises(ValueError):pickup.alignment_turn(origin,origin,1,step_deg=step)
+
+
+    def test_measurement_history_preserves_existing_latest_and_all_new_records(self):
+        import tempfile,json
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as temp,contextlib.redirect_stdout(io.StringIO()):
+            path=Path(temp)/'dice_alignment_measurement.json'
+            previous=dict(delta_xy_mm=[0,0],delta_yaw_deg=-4.5)
+            path.write_text(json.dumps(previous),encoding='utf-8')
+            for correction in (1,2):
+                pickup.save_alignment_measurement(dict(delta_xy_mm=[correction,0]),path=path)
+            history=json.loads(path.with_name('dice_alignment_history.json').read_text())
+            self.assertEqual(len(history['measurements']),3)
+            self.assertEqual(history['measurements'][0]['report'],previous)
+            self.assertEqual(json.loads(path.read_text())['delta_xy_mm'],[2,0])
+
+    def test_bad_history_is_not_overwritten(self):
+        import tempfile,json
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/'dice_alignment_measurement.json'
+            path.write_text('{"keep": true}',encoding='utf-8')
+            history=path.with_name('dice_alignment_history.json')
+            history.write_text('{"version": 99}',encoding='utf-8')
+            with self.assertRaisesRegex(ValueError,'Invalid alignment history'):
+                pickup.save_alignment_measurement({},path=path)
+            self.assertTrue(json.loads(path.read_text())['keep'])
+            self.assertEqual(json.loads(history.read_text())['version'],99)

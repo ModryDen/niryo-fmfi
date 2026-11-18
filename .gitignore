@@ -48,3 +48,9 @@ dice_grip_orientation.json.tmp
 # Operator alignment measurements (not calibration)
 dice_alignment_measurement.json
 dice_alignment_measurement.json.tmp
+
+dice_alignment_samples.json
+dice_alignment_samples.json.tmp
+
+dice_alignment_history.json
+dice_alignment_history.json.tmp

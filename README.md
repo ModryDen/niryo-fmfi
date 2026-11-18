@@ -592,3 +592,83 @@ rise and return to overview use 20%. After a completed preview, the arm speed
 setting is reset to 10%. If manual alignment pose feedback times out, terminal
 command WAIT rechecks feedback only; it never resends the movement. Other input
 stops in place, as do hardware or trajectory errors.
+
+
+### Learn automatic preview compensation
+
+This is a learned correction of repeatable position/yaw error, not closed-loop
+camera tracking, and does not enable descent to grip height or gripping. Existing
+single `dice_alignment_measurement.json` files are not imported as training data.
+
+Start from the camera overview with the empty gripper and a fixed physical setup:
+
+```powershell
+.\.venv\Scripts\python.exe .\experiments\vision\dice_object_detection-rectified.py --enable-motion --preview-pick --refresh-area-view --board-area --preview-clearance-mm 30 --auto-yaw --live-align --teach-alignment --preview-speed 50
+```
+
+Confirm BOARD FIXED, select a stable non-glare die, P, PREVIEW. At inspection use
+A/D (robot X), S/W (robot Y), keys 1/2/3 (1/2/5 mm), J/L (yaw -/+ 2 degrees).
+Keep the die stationary during an example. Enter explicitly confirms that the
+jaw midpoint is centred above the die and the jaw closing axis is parallel to a
+die edge; it stores the example and rises vertically with the corrected yaw before
+returning. Q/Esc stops without recording or returning. No gripper commands.
+If pose feedback times out, WAIT in the terminal only rechecks the pose.
+
+Collect at least eight examples spread around the working area and with at least
+30 degrees of rotation spread. Use outside positions to enclose the area to be
+used later. Examples closer than 10 mm with rotation difference below 10 degrees
+are rejected as near-duplicates. Saved examples accumulate in
+`experiments/vision/dice_alignment_samples.json`, bound to the camera intrinsics,
+original mapping, board reference, tool and jaw reference. Do not move the board,
+base, tool/camera mounting or change cube height. A physical change requires new
+teaching; software binding cannot detect an unchanged-looking physical change.
+
+The model fits world XY offset plus a yaw-dependent rotating XY offset and a
+constant yaw correction. Leave-one-out prediction must be within 2 mm and 2 deg
+on every example, with adequate position and angle coverage. These limits test
+consistency of operator labels, not measured physical accuracy. Outliers are
+rejected rather than silently discarded. Poor fit may require correcting the
+original mapping or camera/tool calibration instead of adding samples.
+
+After ALIGNMENT READY, quit and replace --teach-alignment with --use-alignment.
+On new cube positions/angles, the correction is applied automatically to the
+confirmed preview route. Keep --live-align to inspect it and manually stop or
+adjust. It cannot extrapolate beyond the sampled convex position hull or angle
+range. The corrected command must stay on the board, within 20 mm XY and 15 deg
+of its original prediction. Inspection height remains 30 mm above taught grip Z.
+Validate on new positions before considering a later gripping implementation.
+Changing the jaw reference with Y invalidates the learned compensation.
+
+
+Fine yaw measurement is also available in ordinary --live-align preview without
+--teach-alignment. J/L turn yaw -/+; keys 1/2/3 select yaw steps 0.5/1/2 degrees
+and XY steps 1/2/5 mm. Z, roll and pitch stay fixed. Maximum yaw correction remains
+15 degrees. Enter saves delta_yaw_deg as well as delta_xy_mm in the measurement,
+then rises with the corrected orientation before returning. Without teaching,
+this measurement does not append to or change the learned model or jaw reference.
+
+
+Every confirmed live inspection now appends to `dice_alignment_history.json`
+before updating `dice_alignment_measurement.json`. The previously saved latest
+measurement is imported on the first history write. Older overwritten latest-only
+measurements cannot be recovered by this change. History collection does not
+train or enable a correction model: only --teach-alignment appends bound examples
+to dice_alignment_samples.json. Existing inconsistent training samples are kept
+and remain blocked by validation; no limits are relaxed or samples discarded.
+
+
+In --repair-pick, physically re-recorded heights may be staged one target at a
+time when switching from inspection height to grip height. Mixed heights set
+height_repair_pending and block both general calibration validation and the
+fixed-target motion shortcut. All five measured heights must agree within 2 mm
+before CHECK; orientation checks still apply on every RECORD. No XYZ values are
+filled in automatically, and the old validated calibration is not replaced until
+CHECK passes. The repair workflow backs up the original draft on entry.
+
+
+Repair RECORD now waits up to 10 seconds for two consecutive stationary pose
+readings before saving. It retains the measured six values and the original
+1.15-degree orientation / 2-mm position limits. A persistent mismatch, movement,
+Learning Mode, or hardware error rejects the record and preserves the old one.
+Confirm success by both `Record N saved` and the updated XYZ shown in the menu;
+typing RECORD alone is not a successful save. This wait sends no motion commands.

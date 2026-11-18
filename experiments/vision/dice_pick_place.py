@@ -56,6 +56,8 @@ class PickCalibration(CameraCalibration):
     def __init__(self, data):
         if data.get('purpose') != 'dice_pick_place':
             raise ValueError('Expected a separate gripper pick/place calibration.')
+        if data.get('height_repair_pending'):
+            raise ValueError('Height repair incomplete: re-record all five pickup heights before CHECK.')
         overview = pose_array(data.get('pickup_reference_pose', data['overview']))
         for index, pose in enumerate(data['poses'], 1):
             angle = orientation_distance(overview, pose)
@@ -142,6 +144,9 @@ def resolve_pick_target(calibration, pixel, image_size, workspace=None, box=None
         if box is None or workspace is None:
             raise ValueError('Auto rotation requires a current die outline and board.')
         target = apply_die_yaw(calibration, target, box, workspace)
+    if getattr(calibration, "alignment_model", None) is not None:
+        from dice_alignment_calibration import apply_alignment
+        target = apply_alignment(calibration, target)
     return target
 
 
@@ -159,6 +164,8 @@ class TaughtTargetPickup:
     """One fixed, physically taught target. No image-to-robot interpolation."""
 
     def __init__(self, data, number):
+        if data.get('height_repair_pending'):
+            raise ValueError('Finish height repair and CHECK before fixed-target motion.')
         if data.get('purpose') != 'dice_pick_place' or number not in range(1, 6):
             raise ValueError('Select a recorded pickup target from 1 to 5.')
         self.overview = pose_array(data['overview'])
@@ -355,7 +362,7 @@ def teach_pick_calibration(robot, intrinsics):
 
 
 
-def replace_pick_record(data, label, pose):
+def replace_pick_record(data, label, pose, stage_height=False):
     """Replace one physically re-taught pose; never manufacture orientation values."""
     from copy import deepcopy
     pose = pose_array(pose)
@@ -376,8 +383,13 @@ def replace_pick_record(data, label, pose):
         if index not in range(5) or len(data['poses']) != 5:
             raise ValueError('Need a complete five-point draft and target number 1-5.')
         heights = [p[2] for i, p in enumerate(data['poses']) if i != index] + [pose[2]]
-        if np.ptp(heights) > .002:
+        if pose[2] >= pose_array(data['overview'])[2] - .002:
+            raise ValueError('Pickup must remain below overview height.')
+        mismatch = bool(np.ptp(heights) > .002)
+        if mismatch and not stage_height:
             raise ValueError('Not recorded: pickup Z must match the other targets within 2 mm.')
+        if stage_height:
+            result['height_repair_pending'] = mismatch
         result['poses'][index] = pose.tolist()
     return result
 
@@ -585,12 +597,16 @@ def repair_pick_calibration(robot, intrinsics):
         old = data['drop'] if command == 'D' else data['poses'][int(command) - 1]
         print(f'Record {command}; previous tool XYZ: {np.round(old[:3], 6).tolist()}')
         print('In Studio: lift clear, set the required orientation, then manually position the OPEN gripper.')
-        print('At pickup, the die must be between the fingers without moving it. Keep the original pickup Z.')
+        print('At pickup, the die must be between the fingers without moving it. Use the physically checked grip height.')
+        print('Height changes are saved as a draft only. Re-record all five at the same height before CHECK.')
         print('Use Pose with fixed Roll/Pitch/Yaw; inspect actual values after movement.')
         if input('When stopped at the corrected pose, type RECORD (anything else cancels): ').strip() != 'RECORD':
             continue
         try:
-            updated = replace_pick_record(data, command, robot.get_pose().to_list())
+            reference = data.get('pickup_reference_pose', data['overview'])
+            print('Waiting up to 10 seconds for stable pose feedback; no movement commands.')
+            recorded = read_stable_teaching_pose(robot, reference)
+            updated = replace_pick_record(data, command, recorded, stage_height=True)
         except ValueError as error:
             print(error)
             print('Previous record kept. No need to repeat the other targets.')
@@ -747,10 +763,12 @@ def preview_pick(robot, calibration, pixel, image_size, revalidate, workspace=No
         if label == 'lower inspection':
             if inspection_callback is not None:
                 corrected = pose_array(inspection_callback(lower.copy()))
-                if not np.allclose(corrected[2:], lower[2:], atol=1e-9, rtol=0):
+                if not np.allclose(corrected[2:5], lower[2:5], atol=1e-9, rtol=0) or abs((corrected[5]-lower[5]+np.pi) % (2*np.pi)-np.pi) > np.deg2rad(15)+1e-9:
                     raise ValueError('Invalid inspection correction. Stopped without recovery movement.')
-                require_pose(robot.get_pose().to_list(), corrected, angle_tolerance=OVERVIEW_ANGLE_TOLERANCE)
+                wait_for_preview_pose(robot, corrected)
+                require_gripper_healthy(robot)
                 above[:2] = corrected[:2]  # Rise vertically from the corrected XY.
+                above[3:] = corrected[3:]
                 robot.set_arm_max_velocity(20)
                 current_speed = 20
             elif input('Inspect alignment on the REAL robot. Type RETURN to rise and return; anything else stops here: ').strip() != 'RETURN':
@@ -775,7 +793,7 @@ def alignment_step(origin, current, axis, direction, step_mm=5):
     return target
 
 
-def live_inspection(robot, planned, intrinsics, robot_ip):
+def live_inspection(robot, planned, intrinsics, robot_ip, on_record=None):
     """Operator-guided camera inspection. No automatic tracking, descent or grip."""
     import time
     origin = pose_array(planned)
@@ -784,12 +802,16 @@ def live_inspection(robot, planned, intrinsics, robot_ip):
     keys = {ord('a'): (0,-1), ord('d'): (0,1), ord('s'): (1,-1), ord('w'): (1,1)}
     require_live_camera(robot_ip)
     require_gripper_healthy(robot)
+    wait_for_preview_pose(robot, current)
     initial_actual = pose_array(robot.get_pose().to_list())
-    require_pose(initial_actual, current, angle_tolerance=OVERVIEW_ANGLE_TOLERANCE)
     print('Live MANUAL alignment: A/D = robot X -/+, S/W = robot Y -/+. Default step 5 mm.')
-    print('Keys 1/2/3 select steps 1/2/5 mm. Speed 20%. Release keys between taps.')
-    print('Watch the REAL fingers. Z and rotation stay fixed. No total XY displacement limit.')
-    print('Enter = save measurement, rise and return. Q/Esc or window close = STOP in place.')
+    print('Keys 1/2/3: XY steps 1/2/5 mm; yaw steps 0.5/1/2 deg. Speed 20%.')
+    print('J/L = yaw -/+. Release keys between taps. Maximum yaw correction 15 degrees.')
+    print('Watch the REAL fingers. Z, roll and pitch stay fixed. No total XY displacement limit.')
+    print('Enter = confirm CENTRED + PARALLEL, save, rise and return. Q/Esc = STOP in place.')
+    if on_record is not None:
+        print('LEARNING: Enter appends the confirmed position AND yaw correction to the sample set.')
+        print('Keep the die fixed. Confirm only when jaw midpoint is centred and jaw axis parallel to a die edge.')
     robot.set_arm_max_velocity(20)
     step_mm = 5
     armed = True
@@ -807,9 +829,13 @@ def live_inspection(robot, planned, intrinsics, robot_ip):
             for index, line in enumerate([
                 f'MANUAL: A/D robot X -/+; S/W robot Y -/+; step {step_mm} mm',
                 f'dX {delta[0]:+.1f} mm  dY {delta[1]:+.1f} mm; Z FIXED; speed 20%',
-                'ENTER: save + rise/return | Q/ESC: STOP here, no recovery',
+                'ENTER: confirm aligned + rise/return | Q/ESC: STOP here',
                 '1/2/3: step 1/2/5 mm. Robot axes are NOT camera left/right.']):
                 cv2.putText(frame,line,(8,22+24*index),cv2.FONT_HERSHEY_SIMPLEX,.46,(0,0,255),1)
+            yaw_step_deg = {1:.5,2:1.,5:2.}[step_mm]
+            delta_yaw_deg = np.degrees((current[5]-origin[5]+np.pi) % (2*np.pi)-np.pi)
+            cv2.putText(frame,f'J/L yaw -/+ {yaw_step_deg:g} deg; correction {delta_yaw_deg:+.1f} deg',
+                        (8,118),cv2.FONT_HERSHEY_SIMPLEX,.46,(0,0,255),1)
             cv2.imshow(title,frame)
             key = cv2.waitKey(30)
             if cv2.getWindowProperty(title,cv2.WND_PROP_VISIBLE) < 1 or key in (27,ord('q')):
@@ -827,28 +853,41 @@ def live_inspection(robot, planned, intrinsics, robot_ip):
             if key in (ord('1'),ord('2'),ord('3')):
                 step_mm = {ord('1'):1,ord('2'):2,ord('3'):5}[key]
                 continue
-            if key not in keys and key not in (10,13):
+            yaw_key = key in (ord('j'),ord('l'))
+            if key not in keys and key not in (10,13) and not yaw_key:
                 continue
             require_live_camera(robot_ip)
             checked_at = time.monotonic()
             require_gripper_healthy(robot)
             if robot.get_learning_mode():
                 raise ValueError('Learning Mode enabled. Stopped without recovery movement.')
-            require_pose(robot.get_pose().to_list(),current,angle_tolerance=OVERVIEW_ANGLE_TOLERANCE)
+            wait_for_preview_pose(robot,current)
+            # WAIT can leave the terminal paused: recheck interlocks before acting.
+            require_live_camera(robot_ip)
+            checked_at = time.monotonic()
+            require_gripper_healthy(robot)
+            if robot.get_learning_mode():
+                raise ValueError("Learning Mode enabled while waiting. Stopped in place.")
             if key in (10,13):
                 report = dict(mode='manual_preview_only', planned=origin.tolist(),
                               initial_actual=initial_actual.tolist(), corrected_command=current.tolist(),
                               corrected_actual=robot.get_pose().to_list(),
-                              delta_xy_mm=delta.tolist(), step_mm=step_mm, speed_percent=20,
+                              delta_xy_mm=delta.tolist(), delta_yaw_deg=float(delta_yaw_deg),
+                              step_mm=step_mm, yaw_step_deg=yaw_step_deg, speed_percent=20,
                               automatic_tracking=False, automatically_applied=False)
-                path = Path(__file__).with_name('dice_alignment_measurement.json')
-                temporary = path.with_suffix('.json.tmp')
-                temporary.write_text(json.dumps(report,indent=2),encoding='utf-8')
-                temporary.replace(path)
-                print(f'Alignment measurement saved: {path}. Pickup calibration unchanged.')
+                save_alignment_measurement(report)
+                if on_record is not None:
+                    try:
+                        on_record(report)
+                    except ValueError as error:
+                        print(f'Learning example NOT saved: {error}')
                 return current
             try:
-                target = alignment_step(origin,current,*keys[key],step_mm=step_mm)
+                if yaw_key:
+                    target = alignment_turn(origin,current,-1 if key == ord('j') else 1,step_deg=yaw_step_deg)
+                else:
+                    # Current yaw may have been manually corrected during learning.
+                    target = alignment_step(current,current,*keys[key],step_mm=step_mm)
             except ValueError as error:
                 print(error)
                 continue
@@ -858,3 +897,83 @@ def live_inspection(robot, planned, intrinsics, robot_ip):
             current = target
     finally:
         cv2.destroyWindow(title)
+
+
+
+def alignment_turn(origin, current, direction, step_deg=2):
+    if direction not in (-1,1) or isinstance(step_deg,bool) or step_deg not in (.5,1,2):
+        raise ValueError('Yaw step must be 0.5, 1 or 2 degrees with direction -/+1.')
+    origin,current=pose_array(origin),pose_array(current)
+    if not np.allclose(origin[2:5],current[2:5],atol=1e-9,rtol=0):
+        raise ValueError('Yaw alignment must keep Z, roll and pitch fixed.')
+    target=current.copy()
+    target[5]+=direction*np.deg2rad(step_deg)
+    if abs((target[5]-origin[5]+np.pi) % (2*np.pi)-np.pi) > np.deg2rad(15)+1e-9:
+        raise ValueError('Yaw correction limit 15 degrees; inspect jaw reference instead.')
+    return target
+
+
+
+def save_alignment_measurement(report, path=None):
+    """Keep every confirmed inspection, independently from learning samples."""
+    from datetime import datetime, timezone
+    path = Path(__file__).with_name('dice_alignment_measurement.json') if path is None else Path(path)
+    history_path = path.with_name('dice_alignment_history.json')
+    if history_path.exists():
+        history = json.loads(history_path.read_text(encoding='utf-8'))
+        if history.get('version') != 1 or not isinstance(history.get('measurements'),list):
+            raise ValueError('Invalid alignment history. Existing measurements were not overwritten.')
+    else:
+        history = dict(version=1,measurements=[])
+        if path.exists():
+            previous = json.loads(path.read_text(encoding='utf-8'))
+            history['measurements'].append(dict(
+                recorded_at=datetime.fromtimestamp(path.stat().st_mtime,timezone.utc).isoformat(),
+                source='previous_latest_measurement',report=previous))
+    history['measurements'].append(dict(recorded_at=datetime.now(timezone.utc).isoformat(),
+                                        source='confirmed_live_inspection',report=report))
+    # Write history first, so an interrupted latest-file update cannot lose a measurement.
+    temporary = history_path.with_suffix('.json.tmp')
+    temporary.write_text(json.dumps(history,indent=2),encoding='utf-8')
+    temporary.replace(history_path)
+    temporary = path.with_suffix('.json.tmp')
+    temporary.write_text(json.dumps(report,indent=2),encoding='utf-8')
+    temporary.replace(path)
+    print(f'Alignment measurement saved: {path}. History count: {len(history["measurements"])}.')
+    print('Measurement history is NOT a trained model. Pickup calibration unchanged.')
+
+
+
+def read_stable_teaching_pose(robot, reference, timeout=10.0, interval=.1):
+    """Record an actual stable pose; never replace measured orientation with desired RPY."""
+    import time
+    require_gripper_healthy(robot)
+    if robot.get_learning_mode():
+        raise ValueError('Not recorded: disable Learning Mode and release manual control first.')
+    anchor = pose_array(robot.get_pose().to_list()).copy()
+    expected = anchor.copy()
+    expected[3:] = pose_array(reference)[3:]
+    deadline = time.monotonic() + timeout
+    matching = 0
+    previous = None
+    while True:
+        require_gripper_healthy(robot)
+        if robot.get_learning_mode():
+            raise ValueError('Not recorded: Learning Mode enabled while waiting.')
+        actual = pose_array(robot.get_pose().to_list()).copy()
+        try:
+            require_pose(actual, expected)  # Original 2 mm / 1.15 degree limits.
+            if previous is not None:
+                require_pose(actual, previous)
+            matching += 1
+            if matching >= 2:
+                return actual.tolist()
+            previous = actual
+        except ValueError as error:
+            matching = 0
+            previous = None
+            last_error = error
+        if time.monotonic() >= deadline:
+            detail = str(last_error) if 'last_error' in locals() else 'Two stable readings were not confirmed.'
+            raise ValueError('Not recorded: pose feedback did not stabilise. ' + detail)
+        time.sleep(interval)

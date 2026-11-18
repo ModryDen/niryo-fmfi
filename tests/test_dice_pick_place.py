@@ -476,3 +476,68 @@ class PickPlaceTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class StagedHeightRepairTests(unittest.TestCase):
+    def test_height_can_be_physically_rerecorded_one_point_at_a_time(self):
+        data=sample_data()
+        data.update(purpose='dice_pick_place',drop=[.3,.1,.22,0,1.57,0],
+                    board_corners=[[100,80],[540,80],[540,420],[100,420]],tool='GRIPPER_1')
+        original=json.dumps(data)
+        result=data
+        for index in range(5):
+            pose=list(result['poses'][index]);pose[2]=.13
+            result=pickup.replace_pick_record(result,str(index+1),pose,stage_height=True)
+            self.assertEqual(result['height_repair_pending'],index<4)
+            if index<4:
+                with self.assertRaisesRegex(ValueError,'Height repair incomplete'):PickCalibration(result)
+                with self.assertRaisesRegex(ValueError,'Finish height repair'):pickup.TaughtTargetPickup(result,1)
+        self.assertEqual(json.dumps(data),original)
+        self.assertAlmostEqual(PickCalibration(result).poses[0][2],.13)
+
+    def test_staging_does_not_accept_bad_orientation(self):
+        data=sample_data();pose=list(data['poses'][0]);pose[2]=.13;pose[4]+=.1
+        before=json.dumps(data)
+        with self.assertRaisesRegex(ValueError,'orientation differs'):
+            pickup.replace_pick_record(data,'1',pose,stage_height=True)
+        self.assertEqual(json.dumps(data),before)
+
+
+class StableTeachingPoseTests(unittest.TestCase):
+    setUp=PickPlaceTests.setUp
+    move=PickPlaceTests.move
+
+    def test_transient_angle_error_waits_then_records_real_pose(self):
+        reference=self.pose.copy()
+        bad=reference.copy();bad[5]+=.06
+        good=reference.copy();good[0]+=.0001;good[5]+=.002
+        self.robot.get_pose.return_value.to_list.side_effect=[bad.tolist(),bad.tolist(),good.tolist(),good.tolist()]
+        actual=pickup.read_stable_teaching_pose(self.robot,reference,timeout=1,interval=0)
+        np.testing.assert_array_equal(actual,good)
+        self.assertNotEqual(actual[5],reference[5])
+        self.robot.move_linear_pose.assert_not_called()
+        self.robot.open_gripper.assert_not_called()
+        self.robot.close_gripper.assert_not_called()
+
+    def test_persistent_bad_angle_is_not_recorded(self):
+        reference=self.pose.copy();self.pose[5]+=.06
+        with self.assertRaisesRegex(ValueError,'Not recorded'):
+            pickup.read_stable_teaching_pose(self.robot,reference,timeout=0)
+        self.robot.move_linear_pose.assert_not_called()
+
+    def test_xyz_movement_while_waiting_is_rejected(self):
+        reference=self.pose.copy();moved=reference.copy();moved[0]+=.003
+        self.robot.get_pose.return_value.to_list.side_effect=[reference.tolist(),moved.tolist()]
+        with self.assertRaisesRegex(ValueError,'Not recorded'):
+            pickup.read_stable_teaching_pose(self.robot,reference,timeout=0)
+        self.robot.move_linear_pose.assert_not_called()
+
+    def test_learning_mode_and_hardware_fault_cannot_be_waited_through(self):
+        self.robot.get_learning_mode.return_value=True
+        with self.assertRaisesRegex(ValueError,'Learning Mode'):
+            pickup.read_stable_teaching_pose(self.robot,self.pose)
+        self.robot.get_learning_mode.return_value=False
+        self.robot.get_hardware_status.return_value.hardware_errors=[0,1]
+        with self.assertRaisesRegex(ValueError,'hardware errors'):
+            pickup.read_stable_teaching_pose(self.robot,self.pose)
+        self.robot.move_linear_pose.assert_not_called()

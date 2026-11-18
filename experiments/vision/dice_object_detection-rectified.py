@@ -408,7 +408,15 @@ def main():
     parser.add_argument('--preview-speed', type=int, default=None, choices=range(1,51),
                         help='Upper approach speed for preview, default 50 percent; inspection, rise and return use 20 percent.')
     parser.add_argument('--live-align', action='store_true', help='Live manual XY alignment at lower preview height; no descent or grip.')
+    parser.add_argument('--teach-alignment', action='store_true', help='Collect centred and parallel manual XY/yaw examples for automatic compensation.')
+    parser.add_argument('--use-alignment', action='store_true', help='Apply checked learned XY/yaw compensation in preview only.')
     args = parser.parse_args()
+    if args.teach_alignment and args.use_alignment:
+        parser.error('Choose teaching OR using alignment, not both.')
+    if (args.teach_alignment or args.use_alignment) and (not args.preview_pick or not args.auto_yaw or args.preview_clearance_mm != 30):
+        parser.error('Alignment learning/use requires --preview-pick --auto-yaw --preview-clearance-mm 30.')
+    if args.teach_alignment and not args.live_align:
+        parser.error('--teach-alignment requires --live-align.')
     if args.preview_speed is None:
         args.preview_speed = 50 if args.preview_pick else 10
     if args.live_align and (not args.preview_pick or args.preview_clearance_mm is None):
@@ -475,6 +483,16 @@ def main():
                         pick_calibration.yaw_reference = None
                         print(f'Yaw reference unavailable: {error}')
                     print('Y = teach jaw reference: reference die edge must be parallel to actual jaw closing axis.')
+                if args.teach_alignment or args.use_alignment:
+                    from dice_alignment_calibration import load_samples, load_model
+                    if args.use_alignment:
+                        pick_calibration.alignment_model = load_model(pick_calibration)
+                        model = pick_calibration.alignment_model
+                        print(f'LEARNED COMPENSATION: {model["sample_count"]} examples; maximum leave-one-out error '
+                              f'{model["max_error_mm"]:.2f} mm / {model["max_error_deg"]:.2f} deg. PREVIEW ONLY.')
+                    else:
+                        examples=load_samples(pick_calibration)
+                        print(f'ALIGNMENT LEARNING: {len(examples["samples"])} examples saved; need at least 8 varied positions/rotations.')
                 if args.board_area:
                     pick_calibration.enable_board_area()
                     print("BOARD AREA: M1-M4. Outside the original taught hull this is planar extrapolation; "
@@ -487,7 +505,7 @@ def main():
             except (ValueError, KeyError, OSError) as error:
                 pick_calibration = None
                 print(f"Pickup disabled: {error}")
-                if args.refresh_area_view:
+                if args.refresh_area_view or args.teach_alignment or args.use_alignment:
                     return
         calibration = None
         if args.enable_motion:
@@ -701,7 +719,11 @@ def main():
                         options['clearance_mm'] = args.preview_clearance_mm
                         options['speed_percent'] = args.preview_speed
                         if args.live_align:
-                            options['inspection_callback'] = lambda pose: live_inspection(robot, pose, intrinsics, ROBOT_IP)
+                            on_record = None
+                            if args.teach_alignment:
+                                from dice_alignment_calibration import append_sample
+                                on_record = lambda report: append_sample(pick_calibration,report)
+                            options['inspection_callback'] = lambda pose: live_inspection(robot, pose, intrinsics, ROBOT_IP, on_record=on_record)
                     completed = execute(robot, pick_calibration, selected["center"],
                                         (frame.shape[1], frame.shape[0]), revalidate, **options)
                 except PickupPreflightError as error:
