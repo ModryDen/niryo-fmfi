@@ -12,6 +12,63 @@ pip install -r requirements.txt
 
 After powering on the robot, run `calibration.py` to calibrate it before operating the robot!
 
+## Pick a die anywhere inside the taught area
+
+Use the validated `dice_pick_calibration.json` for a general image-to-tool mapping.
+The four outer taught targets bound the usable region; the fifth is an independent
+check and is not fitted. A fifth-point error above 5 mm disables this mapping;
+the unvalidated draft is never silently used instead. The detector outlines the
+calibrated region in orange and shows the selected tool XYZ. There is no fixed
+cross in this mode: place same-height dice anywhere inside the orange boundary,
+then click a detected die. The pose is calculated for that die, not taught point 5.
+
+To select the full usable platform rather than the smaller four-target hull,
+add `--board-area`. The orange outline then follows M1-M4; marker rings and
+edge exclusions from the dice detector remain excluded. This explicitly extends
+the same planar homography beyond its original training hull, without refitting
+or modifying the independent fifth-point result. Projection singularities and
+invalid board geometry are rejected. Edge accuracy is not established by the
+interior fifth-point check: verify new edge positions with `--preview-pick`
+before any descent. Positions beyond M1-M4 remain blocked.
+
+First verify an upper approach without descent or gripper actuation:
+
+```powershell
+.\.venv\Scripts\python.exe .\experiments\vision\dice_object_detection-rectified.py --enable-motion --preview-pick
+```
+
+Click a die inside the orange outline, press P in the image window, inspect the
+printed route, then type PREVIEW in the terminal. The arm moves above that die
+at the taught overview height and returns. No gripper commands are sent.
+
+After physical calibration and hardware faults have been resolved, full transfers use:
+
+```powershell
+.\.venv\Scripts\python.exe .\experiments\vision\dice_object_detection-rectified.py --enable-motion
+```
+
+Click a die, press P, and confirm PICK to pick and place it into the taught drop.
+Do not add `--taught-target 5`: that option deliberately restricts picking to a
+single fixed taught position. Each cycle requires confirmation. The tool keeps
+the taught pickup orientation and height; individual die yaw is not followed.
+Use isolated dice with clearance for the open fingers and the whole arm path.
+
+If only the camera's returned overview view has small drift, add
+`--refresh-area-view` and confirm `BOARD FIXED` only when the board, robot base,
+camera/tool mounting and object height are unchanged. Unlike fixed-target refresh,
+dice may occupy new positions. This records the current marker positions and
+actual overview for the session, while preserving the ORIGINAL marker reference
+and homography for XY conversion; calibration files are unchanged.
+
+Detected marker correspondences register a selected current-frame pixel into the
+original calibration image before calculating robot XY. The 3-pixel board drift
+limit, overview pose/intrinsics checks, live-frame verification, scene recheck and
+hardware-error blocking remain active. This registration does not permit moving
+the physical board after teaching. Targets outside the four-point hull are rejected,
+even if they lie on the larger board. Object height must match teaching. A passed
+numeric fit and an upper preview do not establish grasp accuracy or collision safety.
+No real robot motion was used for the software tests.
+
 ## Automatic board detection
 
 The rectified detector locates the four concentric circular Niryo markers in each
@@ -397,13 +454,13 @@ the successful legacy format is reused for the connection. Other motion,
 kinematics and network errors are never retried. SDK packet tests intercept
 the transport and do not connect to or move a robot.
 
-After each linear move, pose feedback is polled for up to three seconds,
+After each linear move, pose feedback is polled for up to ten seconds,
 requiring two consecutive readings within the original 2 mm / 0.02 rad limits.
 No motion is resent while waiting. Pick/place also checks hardware status
 before actuating and after each gripper command; reported motor errors block
 further movement. Clear hardware faults in Studio before retrying a cycle.
 
-Pose settling waits up to 3 seconds with the same accuracy limits.
+Pose settling waits up to 10 seconds with the same accuracy limits.
 The trial gripper settings are speed 300, peak effort 30%, holding effort 10%,
 to reduce effort compared with SDK defaults. A successful grasp must still be
 verified physically; these settings are not a guarantee of grip strength.
@@ -446,3 +503,92 @@ for this run. It changes no calibration file or pickup/drop pose. Normal 3-pixel
 marker drift protection applies against this session reference; the selected
 die must still be within 5 pixels of its taught position. It cannot repair a
 physically moved board or recalibrate the camera-to-robot mapping.
+
+Strong glare can make a black die appear white and leave only a side/shadow
+in the threshold mask. The detector now looks for a closed convex quadrilateral
+edge outline in these cases. Recovered centres are labelled GLARE and remain
+estimates: preview is allowed, full pick is blocked until lighting is corrected.
+The regression fixture captures the actual reflective die; its estimated centre
+shifts away from the old shadow contour. This does not correct robot-coordinate
+extrapolation errors near board edges, which require additional physical checks.
+
+### Lower inspection and experimental cube rotation
+
+Add --preview-clearance-mm 80 to --preview-pick for a staged inspection:
+high approach, vertical descent to taught grip Z + 80 mm, pause, vertical rise,
+and return. Minimum permitted clearance is 30 mm; this is relative to tool grip
+height, not measured table clearance. Confirm PREVIEW after checking the entire
+arm path. At the inspection pose type RETURN to rise and go back. Anything else
+ends the session at that pose without recovery. No gripper commands are sent.
+The displayed overview image is frozen during these blocking operations; inspect
+the real arm. This diagnostic does not correct an unknown XY offset.
+
+--auto-yaw currently works only in preview mode. First position a reference cube
+so an edge is parallel to the actual open jaw closing axis, re-select it, press Y,
+and type ALIGNED. The robot stays at its overview pose while the reference is
+recorded. Do not guess jaw alignment from a raw image angle. Reference is saved
+to ignored dice_grip_orientation.json and bound to the mapping and gripper.
+Later chosen cube edges are mapped through the board/image homography into robot
+XY. The inferred jaw axis is aligned by the nearest square-equivalent world-Z
+rotation (at most 45 degrees), preserving roll/pitch and XYZ. The rotation is
+performed at upper approach height before any inspection descent. Glare-uncertain
+outlines are blocked for rotation; changes during confirmation also block motion.
+Full gripping with automatic rotation is not enabled yet: the orientation model
+and actual TCP/grasp-centre offset must be verified physically first, especially
+with a tilted tool. This feature does not claim to compensate that offset.
+
+In general pickup mode, V refreshes the session camera view without restarting
+the application. It reuses the full pose, hardware and fresh-video checks and
+requires BOARD FIXED confirmation; no movement or calibration-file changes occur.
+Do not confirm if the physical board, base or camera/tool mounting moved. A bad
+return pose still blocks refresh. The original mapping remains unchanged.
+Glare recovery also handles a small extra corner from a shadow and can refine
+a flagged centre from one dominant connected bright top-face component. These
+remain GLARE estimates, blocked for full gripping and auto rotation.
+
+Explicit BOARD FIXED area-view teaching accepts up to 10 degrees of camera
+overview rotation while retaining the 2 mm XYZ limit, so the current view can
+be registered through M1-M4. It does not send motion. All four markers, live
+frames, unchanged physical setup confirmation and hardware checks are required.
+The robot must stay still during capture. Only the session camera overview is
+updated; grip/drop orientation, the canonical mapping and saved files remain
+unchanged. Normal movement angular tolerances are not widened.
+
+--preview-speed 50 sets upper preview approach speed. Lower inspection, rise and return use 20%.
+Allowed upper speeds are 1-50 percent; default is 10. Inspection descent and
+the rise from inspection remain at 10 percent. Speed returns to 10 after a
+successful cycle; a failed cycle can leave the last configured limit active.
+This option does not affect full pick/place or gripper speed.
+
+In PREVIEW only, an endpoint feedback timeout offers WAIT to repeat the
+read-only pose check for another 10 seconds. No motion command is resent and
+no tolerance is widened. Any other input stops at the current pose. Hardware
+faults stop immediately instead of offering WAIT; motion command errors are
+not retried. Full pick/place still stops on an unconfirmed endpoint.
+
+
+### Live manual inspection alignment
+
+Add `--live-align` to `--enable-motion --preview-pick --preview-clearance-mm 30`
+(with the usual area/reference options). This is operator-guided XY alignment,
+not automatic visual servoing. The selected die may be hidden by the fingers;
+there is no calibrated image target for the jaw centre yet. No additional descent
+or gripper action is enabled.
+
+At the lower inspection height, a live camera window replaces the terminal pause.
+Tap **A/D** for robot **X -/+**, **S/W** for robot **Y -/+**, 5 mm per tap by default; keys **1/2/3** select **1/2/5 mm**.
+Robot axes do not correspond to camera left/right. Check the real fingers and
+release the key between taps. Nudges use 20% speed and preserve commanded Z/RPY. There is no cumulative XY
+displacement limit; each movement still requires a separate key tap and valid
+camera, pose and hardware checks.
+Enter saves `experiments/vision/dice_alignment_measurement.json`, rises vertically
+at the corrected XY, and returns to overview. This measurement does not update
+pickup mapping, apply a correction on the next run, or authorize gripping. Q/Esc, closing the window, camera failure,
+or a hardware/motion error stops in place without an automatic recovery move.
+The normal pose feedback limits still apply.
+
+Preview upper approach now defaults to 50%; descent, manual alignment, vertical
+rise and return to overview use 20%. After a completed preview, the arm speed
+setting is reset to 10%. If manual alignment pose feedback times out, terminal
+command WAIT rechecks feedback only; it never resends the movement. Other input
+stops in place, as do hardware or trajectory errors.

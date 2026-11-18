@@ -16,8 +16,11 @@ from dice_camera_calibration import (
     teach_calibration,
 )
 from dice_workspace import detect_workspace, find_ring_markers, order_corners
+from dice_grip_orientation import make_reference, save_reference, load_reference, die_world_angle, square_angle_difference
 from dice_pick_place import (
-    PICK_FILE, load_pick_calibration, teach_pick_calibration, repair_pick_calibration, pick_and_place, PickupPreflightError, load_taught_target, refresh_fixed_reference,
+    PICK_FILE, PickCalibration, load_pick_calibration, teach_pick_calibration,
+    repair_pick_calibration, pick_and_place, preview_pick, live_inspection, resolve_pick_target,
+    PickupPreflightError, load_taught_target, refresh_fixed_reference, refresh_area_reference,
 )
 
 ROBOT_IP = "169.254.200.200"
@@ -118,6 +121,58 @@ def align_ecc(reference, image):
         return image, None
 
 
+
+def recover_glare_contours(gray, workspace_mask, contours, threshold):
+    """Recover bright die outlines; flag estimates rather than trust a shadow centre."""
+    candidates = [(contour, False) for contour in contours]
+    edges = cv2.Canny(gray, 40, 100)
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    outlines, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    for outline in outlines:
+        perimeter = cv2.arcLength(outline, True)
+        if perimeter == 0:
+            continue
+        quad = cv2.approxPolyDP(outline, .04 * perimeter, True)
+        if len(quad) == 5:
+            quad = cv2.approxPolyDP(outline, .05 * perimeter, True)
+        if len(quad) != 4 or not cv2.isContourConvex(quad):
+            continue
+        area = cv2.contourArea(quad)
+        (_, _), (width, height), _ = cv2.minAreaRect(quad)
+        if area < MIN_AREA or min(width, height) <= 0 or max(width, height) > MAX_DIE_SIZE:
+            continue
+        if min(width, height) / max(width, height) < MIN_ASPECT_RATIO:
+            continue
+        polygon_mask = np.zeros(gray.shape, np.uint8)
+        cv2.fillConvexPoly(polygon_mask, quad.reshape(4, 2), 255)
+        inside = polygon_mask != 0
+        if np.any(inside & (workspace_mask == 0)):
+            continue
+        values = gray[inside]
+        if np.mean(values > 180) < .25 or np.mean(values < threshold) < .20:
+            continue
+        x, y, w, h = cv2.boundingRect(quad)
+        matches = []
+        for index, (old, _) in enumerate(candidates):
+            if cv2.contourArea(old) < MIN_AREA:
+                continue
+            ox, oy, ow, oh = cv2.boundingRect(old)
+            intersection = max(0, min(x+w, ox+ow)-max(x, ox)) * max(0, min(y+h, oy+oh)-max(y, oy))
+            union = w*h + ow*oh - intersection
+            if union and intersection / union > .20:
+                matches.append(index)
+        if len(matches) > 1:
+            continue  # Do not combine neighbouring dice into a single outline.
+        if matches:
+            index = matches[0]
+            old = candidates[index][0]
+            if area > cv2.contourArea(old) * 1.25:
+                candidates[index] = (quad, True)
+        else:
+            candidates.append((quad, True))
+    return candidates
+
+
 def detect_dice(frame):
     workspace = detect_workspace(frame)
     if workspace is None:
@@ -154,7 +209,7 @@ def detect_dice(frame):
 
     detections = []
 
-    for contour in contours:
+    for contour, glare_estimate in recover_glare_contours(gray, workspace_mask, contours, threshold):
         area = cv2.contourArea(contour)
         if area < MIN_AREA:
             continue
@@ -188,6 +243,17 @@ def detect_dice(frame):
         global_contour[:, 0, 0] += x0
         global_contour[:, 0, 1] += y0
 
+        if glare_estimate:
+            # When glare joins most of the bright top face into one component,
+            # use that component instead of a shadow-expanded outer rectangle.
+            bright = np.uint8((gray > 180) & (contour_mask != 0))
+            count, labels, stats, centers = cv2.connectedComponentsWithStats(bright)
+            if count > 1:
+                index = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+                bright_area = stats[index, cv2.CC_STAT_AREA]
+                total_bright = int(np.count_nonzero(bright))
+                if bright_area >= .15 * area and bright_area >= .75 * total_bright:
+                    cx, cy = centers[index]
         center = (
             int(round(cx + x0)),
             int(round(cy + y0))
@@ -204,6 +270,7 @@ def detect_dice(frame):
 
         detections.append({
             "center": center,
+            "glare_estimate": glare_estimate,
             "workspace_position": workspace.relative_position(center),
             "angle": angle,
             "area": area,
@@ -257,7 +324,7 @@ def draw_detections(frame, detections, workspace):
         cx, cy = die["center"]
         cv2.circle(output, (cx, cy), 4, (0, 0, 255), -1)
         cv2.putText(
-            output, f"Die {index}", (cx + 8, cy - 8),
+            output, f"Die {index}" + (" GLARE" if die.get("glare_estimate") else ""), (cx + 8, cy - 8),
             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2
         )
         x_rel, y_rel = die["workspace_position"]
@@ -288,6 +355,30 @@ def draw_taught_target(output, target):
                 (10, output.shape[0] - 40), cv2.FONT_HERSHEY_SIMPLEX, .43, color, 1)
 
 
+
+def draw_pick_area(output, calibration, workspace, selected, image_size):
+    """Show the actual calibrated region and selected robot target, without motion."""
+    if workspace is None:
+        return
+    try:
+        # Keep the usable-area outline visible when a separate reference check
+        # blocks motion. This is a drawing only; target resolution still validates.
+        boundary = np.int32(np.round(calibration.boundary_in_workspace(workspace, validate_reference=False)))
+        cv2.polylines(output, [boundary], True, (0, 180, 255), 2)
+        cv2.putText(output, ('PICK AREA: M1-M4, marker rings excluded' if getattr(calibration, 'board_area', False) else
+                             'PICK AREA: any die centre inside orange outline'),
+                    (10, output.shape[0] - 40), cv2.FONT_HERSHEY_SIMPLEX, .45, (0, 180, 255), 1)
+        calibration.check_board(workspace)
+        if selected is not None:
+            pose = resolve_pick_target(calibration, selected['center'], image_size, workspace, box=selected['box'])
+            text = f'Tool X={pose[0]:.4f} Y={pose[1]:.4f} Z={pose[2]:.4f} m'
+            cv2.putText(output, text, (10, output.shape[0] - 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, .5, (0, 255, 255), 1)
+    except ValueError as error:
+        cv2.putText(output, f'Pickup blocked: {str(error)[:85]}',
+                    (10, output.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, .4, (0, 0, 255), 1)
+
+
 def main():
     global reference_gray
 
@@ -305,7 +396,35 @@ def main():
                         help="Use one fixed taught die pose directly, without camera mapping interpolation.")
     parser.add_argument("--refresh-fixed-view", action="store_true",
                         help="Confirm unchanged setup and record marker reference for this fixed-target session only.")
+    parser.add_argument("--preview-pick", action="store_true",
+                        help="P confirms an upper approach and return only, without descent or gripping.")
+    parser.add_argument("--refresh-area-view", action="store_true",
+                        help="Confirm a fixed physical setup and register the current camera view for general picking.")
+    parser.add_argument("--board-area", action="store_true",
+                        help="Extend the planar pickup mapping to M1-M4; verify edge positions with --preview-pick first.")
+    parser.add_argument('--preview-clearance-mm', type=float,
+                        help='Lower preview to this distance above taught grip Z (minimum 30 mm); pauses until RETURN.')
+    parser.add_argument('--auto-yaw', action='store_true', help='Align jaw rotation to cube edges using a reference taught with Y.')
+    parser.add_argument('--preview-speed', type=int, default=None, choices=range(1,51),
+                        help='Upper approach speed for preview, default 50 percent; inspection, rise and return use 20 percent.')
+    parser.add_argument('--live-align', action='store_true', help='Live manual XY alignment at lower preview height; no descent or grip.')
     args = parser.parse_args()
+    if args.preview_speed is None:
+        args.preview_speed = 50 if args.preview_pick else 10
+    if args.live_align and (not args.preview_pick or args.preview_clearance_mm is None):
+        parser.error('--live-align requires --preview-pick and --preview-clearance-mm.')
+    if args.preview_speed != 10 and not args.preview_pick:
+        parser.error('--preview-speed is available only with --preview-pick.')
+    if args.preview_clearance_mm is not None and (not args.preview_pick or not np.isfinite(args.preview_clearance_mm) or args.preview_clearance_mm < 30):
+        parser.error('--preview-clearance-mm requires --preview-pick and a value of at least 30.')
+    if args.auto_yaw and (not args.enable_motion or not args.preview_pick or args.taught_target is not None):
+        parser.error('--auto-yaw currently requires general --preview-pick mode; verify rotation and tool offset before gripping.')
+    if args.board_area and (not args.enable_motion or args.taught_target is not None):
+        parser.error("--board-area requires --enable-motion and general mode.")
+    if args.refresh_area_view and (not args.enable_motion or args.taught_target is not None):
+        parser.error("--refresh-area-view requires --enable-motion and general mode (no --taught-target).")
+    if args.preview_pick and not args.enable_motion:
+        parser.error("--preview-pick requires --enable-motion because the arm will move.")
     if args.refresh_fixed_view and args.taught_target is None:
         parser.error("--refresh-fixed-view requires --taught-target.")
     if args.taught_target is not None and not args.enable_motion:
@@ -348,8 +467,28 @@ def main():
         elif args.enable_motion and PICK_FILE.exists():
             try:
                 pick_calibration = load_pick_calibration(intrinsics)
+                if args.auto_yaw:
+                    pick_calibration.auto_yaw = True
+                    try:
+                        pick_calibration.yaw_reference = load_reference(pick_calibration)
+                    except (ValueError, OSError, KeyError) as error:
+                        pick_calibration.yaw_reference = None
+                        print(f'Yaw reference unavailable: {error}')
+                    print('Y = teach jaw reference: reference die edge must be parallel to actual jaw closing axis.')
+                if args.board_area:
+                    pick_calibration.enable_board_area()
+                    print("BOARD AREA: M1-M4. Outside the original taught hull this is planar extrapolation; "
+                          "verify upper approaches at the edges before gripping.")
+                if args.refresh_area_view:
+                    if not refresh_area_reference(robot, pick_calibration, intrinsics, ROBOT_IP):
+                        return
+                print(f"AREA PICK: any detected die inside the selected orange boundary. "
+                      f"Independent fifth-point error: {pick_calibration.error * 1000:.2f} mm.")
             except (ValueError, KeyError, OSError) as error:
+                pick_calibration = None
                 print(f"Pickup disabled: {error}")
+                if args.refresh_area_view:
+                    return
         calibration = None
         if args.enable_motion:
             if CALIBRATION_FILE.exists():
@@ -366,10 +505,11 @@ def main():
         print("These are image-oriented board coordinates, NOT robot XYZ or millimetres.")
         print("Click a die to print its pixel centre and board position.")
         if args.enable_motion:
-            print("M = confirm close-up | B = confirm return | P = pick selected die to taught drop")
+            print("M = confirm close-up | B = confirm return | P = " +
+                  ("preview upper approach (no grip)" if args.preview_pick else "pick selected die to taught drop"))
             if pick_calibration is None:
                 print("Pickup needs separate teaching: run with --teach-pick first.")
-        print("Q = quit (no automatic return) | R = reset alignment reference | S = save")
+        print("V = refresh area view (no motion) | Q = quit | R = reset alignment | S = save")
         cv2.namedWindow("Dice Detection")
         cv2.setMouseCallback("Dice Detection", select_die)
 
@@ -425,6 +565,9 @@ def main():
             output = draw_detections(frame, detections, workspace)
             if args.taught_target is not None and pick_calibration is not None:
                 draw_taught_target(output, pick_calibration)
+            if isinstance(pick_calibration, PickCalibration):
+                draw_pick_area(output, pick_calibration, workspace, selected,
+                               (frame.shape[1], frame.shape[0]))
             if selected is not None:
                 cv2.drawContours(output, [selected["contour"]], -1, (0, 255, 255), 3)
                 cv2.imshow("Selected Die", selected["warped"])
@@ -473,9 +616,50 @@ def main():
                 print("Alignment reference reset.")
             elif key in (ord("m"), ord("b"), ord("p")) and not args.enable_motion:
                 print("Motion blocked: read-only mode. Only dice positions are enabled.")
+            elif key == ord('v'):
+                if not isinstance(pick_calibration, PickCalibration):
+                    print('V needs a loaded general pickup calibration.')
+                    continue
+                try:
+                    if refresh_area_reference(robot, pick_calibration, intrinsics, ROBOT_IP):
+                        selection['pixel'] = None
+                        print('View refreshed. Select the next die.')
+                except ValueError as error:
+                    print(f'View refresh blocked: {error}')
+            elif key == ord('y') and args.auto_yaw:
+                if selected is None or workspace is None or not isinstance(pick_calibration, PickCalibration):
+                    print('Select a reference die first.')
+                    continue
+                if selected.get('glare_estimate'):
+                    print('Yaw reference blocked: resolve glare first.')
+                    continue
+                try:
+                    require_live_camera(ROBOT_IP)
+                    actual = robot.get_pose().to_list()
+                    require_pose(actual, pick_calibration.overview, angle_tolerance=OVERVIEW_ANGLE_TOLERANCE)
+                    print('Place a reference cube with one edge PARALLEL to the actual open jaw closing axis.')
+                    print('Re-select the cube after positioning it. This teaches alignment, not a new robot pose.')
+                    if input('Type ALIGNED only if the selected cube is already aligned; anything else cancels: ').strip() != 'ALIGNED':
+                        continue
+                    fresh = read_frame(robot, intrinsics)
+                    fresh_dice, fresh_workspace = detect_dice(fresh)
+                    pick_calibration.check_board(fresh_workspace)
+                    nearest = min(fresh_dice, key=lambda d: np.linalg.norm(np.asarray(d['center'])-selected['center']), default=None)
+                    if nearest is None or nearest.get('glare_estimate') or np.linalg.norm(np.asarray(nearest['center'])-selected['center']) > 3:
+                        raise ValueError('Reference die moved or became uncertain; re-select it.')
+                    require_pose(robot.get_pose().to_list(), actual)
+                    reference = make_reference(pick_calibration, nearest['box'], fresh_workspace, actual)
+                    save_reference(reference)
+                    pick_calibration.yaw_reference = reference
+                    print('Jaw reference saved. Auto rotation uses the closest equivalent square orientation.')
+                except ValueError as error:
+                    print(f'Yaw reference blocked: {error}')
             elif key == ord("p"):
                 if pick_calibration is None or workspace is None or selected is None:
                     print("Pickup blocked: need --teach-pick calibration, four markers and a selected die.")
+                    continue
+                if selected.get('glare_estimate') and (not args.preview_pick or args.auto_yaw):
+                    print('Pickup blocked: glare makes this die centre uncertain. Improve lighting and verify in PREVIEW.')
                     continue
                 try:
                     require_live_camera(ROBOT_IP)
@@ -491,19 +675,35 @@ def main():
                         if len(fresh_dice) != len(detections):
                             raise ValueError("Dice changed during confirmation. Select again.")
                         for old, new in zip(detections, fresh_dice):
+                            if old is selected and args.auto_yaw:
+                                before = die_world_angle(pick_calibration, old['box'], workspace)
+                                after = die_world_angle(pick_calibration, new['box'], fresh_workspace)
+                                if new.get('glare_estimate') or abs(square_angle_difference(before, after)) > np.deg2rad(5):
+                                    raise ValueError('Selected die rotation changed or became uncertain.')
+                            if old is selected and new.get('glare_estimate') and not args.preview_pick:
+                                raise ValueError('Selected die became glare-uncertain during confirmation.')
                             if (np.linalg.norm(np.asarray(old["center"]) - new["center"]) > 3
                                     or abs(new["area"] / old["area"] - 1) > .15):
                                 raise ValueError("Dice moved during confirmation. Select again.")
                     # Errors after the first actuator command propagate and end the session.
-                    pick_calibration.target(selected["center"], (frame.shape[1], frame.shape[0]))
+                    target = resolve_pick_target(pick_calibration, selected["center"],
+                                                 (frame.shape[1], frame.shape[0]), workspace, box=selected["box"])
+                    print('Selected die -> calculated tool XYZ/RPY:', np.round(target, 6).tolist())
                     require_pose(robot.get_pose().to_list(), pick_calibration.overview,
                                  angle_tolerance=OVERVIEW_ANGLE_TOLERANCE)
                 except ValueError as error:
                     print(f"Pickup blocked: {error}")
                     continue
                 try:
-                    completed = pick_and_place(robot, pick_calibration, selected["center"],
-                                               (frame.shape[1], frame.shape[0]), revalidate)
+                    execute = preview_pick if args.preview_pick else pick_and_place
+                    options = dict(workspace=workspace, box=selected['box'])
+                    if args.preview_pick:
+                        options['clearance_mm'] = args.preview_clearance_mm
+                        options['speed_percent'] = args.preview_speed
+                        if args.live_align:
+                            options['inspection_callback'] = lambda pose: live_inspection(robot, pose, intrinsics, ROBOT_IP)
+                    completed = execute(robot, pick_calibration, selected["center"],
+                                        (frame.shape[1], frame.shape[0]), revalidate, **options)
                 except PickupPreflightError as error:
                     selection["pixel"] = None
                     print(f"Pickup cancelled before motion: {error}")
@@ -511,7 +711,8 @@ def main():
                     continue
                 if completed:
                     selection["pixel"] = None
-                    print("Pick/place commands complete; verify the die was transferred.")
+                    print("Preview complete: no gripping was performed." if args.preview_pick else
+                          "Pick/place commands complete; verify the die was transferred.")
             elif key == ord("m"):
                 if workspace is None:
                     print("Motion blocked: all four workspace markers must be visible.")

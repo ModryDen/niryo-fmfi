@@ -74,6 +74,7 @@ class PickCalibration(CameraCalibration):
             raise ValueError('Camera overview must remain above pickup height.')
         self.drop = pose_array(data['drop'])
         self.board = np.asarray(data['board_corners'], dtype=np.float32)
+        self.view_board = self.board.copy()
         self.tool = data['tool']
         if self.board.shape != (4, 2) or not np.isfinite(self.board).all():
             raise ValueError('Invalid reference board corners.')
@@ -82,14 +83,66 @@ class PickCalibration(CameraCalibration):
         if self.drop[2] >= self.overview[2] - 0.002:
             raise ValueError('Drop pose must be below the taught transfer height.')
 
+    def enable_board_area(self):
+        """Explicitly extend the validated planar model to the M1-M4 polygon."""
+        corners = self.board.astype(np.float32)
+        if not cv2.isContourConvex(corners.reshape(-1, 1, 2)) or cv2.contourArea(corners) < 2500:
+            raise ValueError('Invalid M1-M4 board polygon.')
+        denominators = np.column_stack((corners, np.ones(4))) @ self.matrix[2]
+        if not (np.all(denominators > 1e-8) or np.all(denominators < -1e-8)):
+            raise ValueError('Mapping has a projection singularity inside the extended board.')
+        projected = cv2.perspectiveTransform(corners.reshape(1, 4, 2), self.matrix)[0]
+        if not np.isfinite(projected).all() or not cv2.isContourConvex(projected.reshape(-1, 1, 2)):
+            raise ValueError('Invalid robot-coordinate projection of the board.')
+        self.boundary = corners.copy()
+        self.board_area = True
+
     def target(self, pixel, image_size):
         target = super().target(pixel, image_size)
         # Camera overview orientation and physically taught grip orientation differ.
         target[3:] = self.pickup_reference[3:]
         return target
 
+    def target_in_workspace(self, pixel, image_size, workspace):
+        self.check_board(workspace)
+        point = np.asarray(pixel, dtype=np.float32)
+        if point.shape != (2,) or not np.isfinite(point).all():
+            raise ValueError('Target pixels must be finite XY coordinates.')
+        # Use marker correspondences to express the current pixel in the original
+        # calibration image. This does not allow a physically moved board.
+        matrix = cv2.getPerspectiveTransform(workspace.corners.astype(np.float32), self.board)
+        original_pixel = cv2.perspectiveTransform(point.reshape(1, 1, 2), matrix)[0, 0]
+        try:
+            return self.target(original_pixel, image_size)
+        except ValueError as error:
+            if 'outside the calibrated area' in str(error):
+                raise ValueError('Die centre is outside the selected pickup area (orange outline). '
+                                 'Use --board-area for the full M1-M4 board; marker rings remain excluded.') from error
+            raise
+
+    def boundary_in_workspace(self, workspace, validate_reference=True):
+        if validate_reference:
+            self.check_board(workspace)
+        elif workspace is None:
+            raise ValueError('Workspace is not visible.')
+        matrix = cv2.getPerspectiveTransform(self.board, workspace.corners.astype(np.float32))
+        return cv2.perspectiveTransform(self.boundary.reshape(1, -1, 2), matrix)[0]
+
     def check_board(self, workspace):
-        require_board_reference(workspace, self.board)
+        require_board_reference(workspace, self.view_board)
+
+
+def resolve_pick_target(calibration, pixel, image_size, workspace=None, box=None):
+    if isinstance(calibration, PickCalibration) and workspace is not None:
+        target = calibration.target_in_workspace(pixel, image_size, workspace)
+    else:
+        target = calibration.target(pixel, image_size)
+    if getattr(calibration, 'auto_yaw', False):
+        from dice_grip_orientation import apply_die_yaw
+        if box is None or workspace is None:
+            raise ValueError('Auto rotation requires a current die outline and board.')
+        target = apply_die_yaw(calibration, target, box, workspace)
+    return target
 
 
 def load_pick_calibration(intrinsics):
@@ -184,6 +237,45 @@ def refresh_fixed_reference(robot, target, intrinsics, ip_address, confirm=input
     target.board = workspace.corners.copy()
     print('Current session marker reference recorded. Target centre must still match within 5 pixels.')
     print('No motion performed. No calibration files changed.')
+    return True
+
+
+
+def refresh_area_reference(robot, calibration, intrinsics, ip_address, confirm=input):
+    """Session-only camera reference; retain the canonical image-to-tool mapping."""
+    if not isinstance(calibration, PickCalibration):
+        raise ValueError('Area refresh requires a validated general pickup calibration.')
+    require_gripper_healthy(robot)
+    if robot.get_learning_mode():
+        raise ValueError('Disable Learning Mode first.')
+    # This is explicit image-reference teaching, not a movement endpoint check.
+    # A modest view rotation is registered through the four markers; XYZ still
+    # must match within 2 mm. Bound rotation to preserve marker correspondence.
+    capture_angle_limit = np.deg2rad(10)
+    require_pose(robot.get_pose().to_list(), calibration.overview,
+                 angle_tolerance=capture_angle_limit)
+    print('AREA VIEW: update the camera view for this session; robot pickup/drop teaching is unchanged.')
+    print('Confirm that board, robot base, camera/tool mounting and die height match the validated teaching.')
+    print('Dice may be at new positions inside the area. If the board or mounting moved, cancel and re-teach.')
+    if confirm('Type BOARD FIXED to confirm, anything else cancels: ').strip() != 'BOARD FIXED':
+        return False
+    require_live_camera(ip_address)
+    actual = pose_array(robot.get_pose().to_list())
+    require_pose(actual, calibration.overview, angle_tolerance=capture_angle_limit)
+    frame = read_frame(robot, intrinsics)
+    if (frame.shape[1], frame.shape[0]) != calibration.image_size:
+        raise ValueError('Camera image size changed.')
+    workspace = detect_workspace(frame)
+    if workspace is None:
+        require_board_reference(None, calibration.board, frame)
+    require_gripper_healthy(robot)
+    require_pose(robot.get_pose().to_list(), actual, angle_tolerance=OVERVIEW_ANGLE_TOLERANCE)
+    # Never replace calibration.board: it anchors the validated homography.
+    # Live pixels are registered to that original board before robot XY conversion.
+    calibration.view_board = workspace.corners.copy()
+    calibration.overview = actual.copy()
+    print('Area view recorded for this session. Choose any detected die inside the orange boundary.')
+    print('No motion performed and no calibration files changed.')
     return True
 
 
@@ -524,12 +616,12 @@ class PickupPreflightError(ValueError):
     """Rejected before any actuator command; it is safe to keep detecting."""
 
 
-def pick_and_place(robot, calibration, pixel, image_size, revalidate):
+def pick_and_place(robot, calibration, pixel, image_size, revalidate, workspace=None, box=None):
     """One confirmed cycle. Any failed command stops the remaining sequence."""
     require_pose(robot.get_pose().to_list(), calibration.overview, angle_tolerance=OVERVIEW_ANGLE_TOLERANCE)
     if gripper_name(robot) != calibration.tool:
         raise ValueError('Gripper changed. Re-teach pickup.')
-    pickup = calibration.target(pixel, image_size)
+    pickup = resolve_pick_target(calibration, pixel, image_size, workspace, box=box)
     above_pick = pickup.copy()
     above_pick[2] = calibration.overview[2]
     above_drop = calibration.drop.copy()
@@ -577,3 +669,192 @@ def pick_and_place(robot, calibration, pixel, image_size, revalidate):
     move(above_drop, upper=True, label='lift after release')
     move(calibration.overview, upper=True, label='return to camera overview')
     return True
+
+
+
+def wait_for_preview_pose(robot, pose):
+    """Allow explicitly waiting again after delayed feedback, never resend motion."""
+    while True:
+        try:
+            wait_for_pose(robot, pose, angle_tolerance=OVERVIEW_ANGLE_TOLERANCE)
+            return
+        except ValueError as error:
+            # A hardware fault must not become an invitation to wait/retry.
+            require_gripper_healthy(robot)
+            print(f'Preview pose not confirmed: {error}')
+            print('No new movement command will be sent. Keep clear of the arm.')
+            if input('Type WAIT to check pose again, anything else stops here: ').strip() != 'WAIT':
+                raise
+
+
+def preview_pick(robot, calibration, pixel, image_size, revalidate, workspace=None, box=None, clearance_mm=None, speed_percent=50, inspection_callback=None):
+    """Confirm an upper approach to any calibrated position, then return; no grip."""
+    if isinstance(speed_percent, bool) or not isinstance(speed_percent, (int, np.integer)) or not 1 <= speed_percent <= 50:
+        raise ValueError('Preview upper speed must be an integer from 1 to 50 percent.')
+    if inspection_callback is not None and clearance_mm is None:
+        raise ValueError('Live alignment requires a lower inspection height.')
+    require_pose(robot.get_pose().to_list(), calibration.overview,
+                 angle_tolerance=OVERVIEW_ANGLE_TOLERANCE)
+    target = resolve_pick_target(calibration, pixel, image_size, workspace, box=box)
+    above = target.copy()
+    above[2] = calibration.overview[2]
+    if above[2] <= target[2] + .002:
+        raise ValueError('Overview must be above the taught pickup height.')
+    lower = None
+    if clearance_mm is not None:
+        if not np.isfinite(clearance_mm) or clearance_mm < 30:
+            raise ValueError('Preview clearance must be at least 30 mm ABOVE taught grip height.')
+        lower = target.copy()
+        lower[2] = target[2] + clearance_mm / 1000
+        if lower[2] >= above[2] - .002:
+            raise ValueError('Preview inspection height must be below the overview.')
+        print('LOW PREVIEW: no gripper commands. Inspect the WHOLE arm route before confirming.')
+        print('Inspection pose:', np.round(lower,6).tolist())
+        print('Height is relative to taught tool grip Z, not a measured clearance from the table.')
+    else:
+        print('PREVIEW ONLY: upper approach and return. No descent or gripper commands.')
+    print('Calculated pickup XYZ/RPY (NOT executed):', np.round(target, 6).tolist())
+    print('Executed upper pose:', np.round(above, 6).tolist())
+    print(f'Upper approach speed: {speed_percent}%. Lower inspection, rise and return: 20%. Check the whole arm path.')
+    if input('Type PREVIEW to execute, anything else cancels: ').strip() != 'PREVIEW':
+        return False
+    try:
+        require_pose(robot.get_pose().to_list(), calibration.overview,
+                     angle_tolerance=OVERVIEW_ANGLE_TOLERANCE)
+        if robot.get_learning_mode():
+            raise ValueError('Disable Learning Mode first.')
+        if gripper_name(robot) != calibration.tool:
+            raise ValueError('Configured gripper changed.')
+        revalidate()
+        require_gripper_healthy(robot)
+    except ValueError as error:
+        raise PickupPreflightError(str(error)) from error
+    robot.set_arm_max_velocity(speed_percent)
+    current_speed = speed_percent
+    route = [('upper preview', above)]
+    if lower is not None:
+        route.extend([('lower inspection', lower), ('rise after inspection', above)])
+    route.append(('return to overview', calibration.overview))
+    for label, pose in route:
+        stage_speed = speed_percent if label == 'upper preview' else 20
+        if stage_speed != current_speed:
+            robot.set_arm_max_velocity(stage_speed)
+            current_speed = stage_speed
+        print(f'Preview stage: {label}', flush=True)
+        move_linear_pose_compatible(robot, pose)
+        wait_for_preview_pose(robot, pose)
+        require_gripper_healthy(robot)
+        if label == 'lower inspection':
+            if inspection_callback is not None:
+                corrected = pose_array(inspection_callback(lower.copy()))
+                if not np.allclose(corrected[2:], lower[2:], atol=1e-9, rtol=0):
+                    raise ValueError('Invalid inspection correction. Stopped without recovery movement.')
+                require_pose(robot.get_pose().to_list(), corrected, angle_tolerance=OVERVIEW_ANGLE_TOLERANCE)
+                above[:2] = corrected[:2]  # Rise vertically from the corrected XY.
+                robot.set_arm_max_velocity(20)
+                current_speed = 20
+            elif input('Inspect alignment on the REAL robot. Type RETURN to rise and return; anything else stops here: ').strip() != 'RETURN':
+                raise ValueError('Stopped at inspection height. No automatic recovery movement.')
+    if current_speed != 10:
+        robot.set_arm_max_velocity(10)
+    return True
+
+
+
+def alignment_step(origin, current, axis, direction, step_mm=5):
+    """An explicit operator step in ROBOT axes; keep height and orientation."""
+    if axis not in (0, 1) or direction not in (-1, 1):
+        raise ValueError('Only robot X/Y steps are allowed.')
+    if isinstance(step_mm, bool) or step_mm not in (1, 2, 5):
+        raise ValueError('Alignment step must be 1, 2 or 5 mm.')
+    origin, current = pose_array(origin), pose_array(current)
+    if not np.allclose(current[2:], origin[2:], atol=1e-9, rtol=0):
+        raise ValueError('Alignment must keep Z and orientation fixed.')
+    target = current.copy()
+    target[axis] += direction * step_mm / 1000
+    return target
+
+
+def live_inspection(robot, planned, intrinsics, robot_ip):
+    """Operator-guided camera inspection. No automatic tracking, descent or grip."""
+    import time
+    origin = pose_array(planned)
+    current = origin.copy()
+    title = 'LIVE MANUAL ALIGNMENT - robot axes, NOT image axes'
+    keys = {ord('a'): (0,-1), ord('d'): (0,1), ord('s'): (1,-1), ord('w'): (1,1)}
+    require_live_camera(robot_ip)
+    require_gripper_healthy(robot)
+    initial_actual = pose_array(robot.get_pose().to_list())
+    require_pose(initial_actual, current, angle_tolerance=OVERVIEW_ANGLE_TOLERANCE)
+    print('Live MANUAL alignment: A/D = robot X -/+, S/W = robot Y -/+. Default step 5 mm.')
+    print('Keys 1/2/3 select steps 1/2/5 mm. Speed 20%. Release keys between taps.')
+    print('Watch the REAL fingers. Z and rotation stay fixed. No total XY displacement limit.')
+    print('Enter = save measurement, rise and return. Q/Esc or window close = STOP in place.')
+    robot.set_arm_max_velocity(20)
+    step_mm = 5
+    armed = True
+    released_at = None
+    checked_at = time.monotonic()
+    cv2.namedWindow(title)
+    try:
+        while True:
+            if time.monotonic() - checked_at > 2:
+                require_live_camera(robot_ip)
+                require_gripper_healthy(robot)
+                checked_at = time.monotonic()
+            frame = read_frame(robot, intrinsics)
+            delta = (current[:2]-origin[:2])*1000
+            for index, line in enumerate([
+                f'MANUAL: A/D robot X -/+; S/W robot Y -/+; step {step_mm} mm',
+                f'dX {delta[0]:+.1f} mm  dY {delta[1]:+.1f} mm; Z FIXED; speed 20%',
+                'ENTER: save + rise/return | Q/ESC: STOP here, no recovery',
+                '1/2/3: step 1/2/5 mm. Robot axes are NOT camera left/right.']):
+                cv2.putText(frame,line,(8,22+24*index),cv2.FONT_HERSHEY_SIMPLEX,.46,(0,0,255),1)
+            cv2.imshow(title,frame)
+            key = cv2.waitKey(30)
+            if cv2.getWindowProperty(title,cv2.WND_PROP_VISIBLE) < 1 or key in (27,ord('q')):
+                raise ValueError('Live alignment stopped in place. No automatic recovery movement.')
+            if key == -1:
+                if released_at is None:
+                    released_at = time.monotonic()
+                if time.monotonic()-released_at >= .3:
+                    armed = True
+                continue
+            released_at = None
+            if not armed:
+                continue
+            armed = False
+            if key in (ord('1'),ord('2'),ord('3')):
+                step_mm = {ord('1'):1,ord('2'):2,ord('3'):5}[key]
+                continue
+            if key not in keys and key not in (10,13):
+                continue
+            require_live_camera(robot_ip)
+            checked_at = time.monotonic()
+            require_gripper_healthy(robot)
+            if robot.get_learning_mode():
+                raise ValueError('Learning Mode enabled. Stopped without recovery movement.')
+            require_pose(robot.get_pose().to_list(),current,angle_tolerance=OVERVIEW_ANGLE_TOLERANCE)
+            if key in (10,13):
+                report = dict(mode='manual_preview_only', planned=origin.tolist(),
+                              initial_actual=initial_actual.tolist(), corrected_command=current.tolist(),
+                              corrected_actual=robot.get_pose().to_list(),
+                              delta_xy_mm=delta.tolist(), step_mm=step_mm, speed_percent=20,
+                              automatic_tracking=False, automatically_applied=False)
+                path = Path(__file__).with_name('dice_alignment_measurement.json')
+                temporary = path.with_suffix('.json.tmp')
+                temporary.write_text(json.dumps(report,indent=2),encoding='utf-8')
+                temporary.replace(path)
+                print(f'Alignment measurement saved: {path}. Pickup calibration unchanged.')
+                return current
+            try:
+                target = alignment_step(origin,current,*keys[key],step_mm=step_mm)
+            except ValueError as error:
+                print(error)
+                continue
+            move_linear_pose_compatible(robot,target)
+            wait_for_preview_pose(robot,target)
+            require_gripper_healthy(robot)
+            current = target
+    finally:
+        cv2.destroyWindow(title)

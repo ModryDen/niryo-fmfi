@@ -41,3 +41,10 @@ diagnostics/camera/pick_diagnostic.png
 diagnostics/camera/pick_diagnostic.json
 
 diagnostics/empty_approach_report.json
+
+dice_grip_orientation.json
+dice_grip_orientation.json.tmp
+
+# Operator alignment measurements (not calibration)
+dice_alignment_measurement.json
+dice_alignment_measurement.json.tmp

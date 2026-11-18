@@ -141,7 +141,7 @@ def require_pose(actual, expected, angle_tolerance=ANGLE_TOLERANCE):
 
 
 
-def wait_for_pose(robot, expected, timeout=3.0, interval=.1, angle_tolerance=ANGLE_TOLERANCE):
+def wait_for_pose(robot, expected, timeout=10.0, interval=.1, angle_tolerance=ANGLE_TOLERANCE):
     """Wait for two matching readings after a command; never resend motion."""
     import time
     expected = pose_array(expected)
